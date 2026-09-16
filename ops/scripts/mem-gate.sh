@@ -14,10 +14,20 @@
 # One scenario per process invocation: peak RSS is a process-lifetime
 # high-water mark, so two scenarios in one process cannot be told apart.
 #
+# --check compares peak_rss_kb and peak_heap_bytes only, and only for the
+# scenarios NOT listed in RECORD_ONLY below. The one exception is
+# scan_fallbacks, judged on every scenario that reports it: it is a count of
+# cold rowmap builds that fell off the streaming path, so any increase over the
+# committed row fails even in record-only mode. The latency, throughput,
+# retention and fragment fields are ungated everywhere: phase 1 accumulates
+# their spread across runs, phase 2 derives thresholds from the median/IQR of
+# what landed here.
+#
 #   ops/scripts/mem-gate.sh                     # ci corpus, all scenarios
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
 #   ops/scripts/mem-gate.sh --check             # gate vs committed baseline
 #   SCENARIOS="rowmap-build-cold" ops/scripts/mem-gate.sh
+#   RECORD_ONLY= ops/scripts/mem-gate.sh --check   # rehearse phase 2: gate all
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -28,13 +38,26 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
-SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session}"
+SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
+# Scenarios that RUN and get a row, but whose numbers gate nothing yet. Over ten
+# interleaved ci runs the two small-allocation scenarios swing several times
+# wider than the gate's own 20% threshold (peak heap: 139% on
+# sync-under-contention, 19% on ingest-throughput), so a threshold there would
+# fire on noise and teach people to ignore the gate. The other three are tighter
+# than that already (0.1-7%) and wait only for enough committed rows to say what
+# "normal" is. Phase 2 promotes a scenario by deleting it from this list.
+# rowmap-build-cold-partial-embed is here for its memory numbers only - its
+# scan_fallbacks count is judged above like every other scenario's.
+#
+# `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
+# scenario" - the way to rehearse a promotion before editing this line.
+RECORD_ONLY="${RECORD_ONLY-search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -125,11 +148,17 @@ done
 
 if [ "$CHECK" = 1 ]; then
   echo "--- check vs committed baseline (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
-  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" <<'EOF'
+  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" "$RECORD_ONLY" <<'EOF'
 import json, os, sys
 baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 scenarios, host = sys.argv[5].split(), sys.argv[6]
+record_only = set(sys.argv[7].split())
 METRICS = ("peak_rss_kb", "peak_heap_bytes")
+# Judged on every scenario, record-only included, and as an absolute count
+# rather than a percentage: a cold rowmap build that stops streaming is a
+# cliff (it re-encodes the whole corpus through the sorting build), and the
+# scenarios that report it exist to catch exactly that.
+COUNTERS = ("scan_fallbacks",)
 try:
     rows = [json.loads(line) for line in open(baseline) if line.strip()]
 except FileNotFoundError:
@@ -147,6 +176,33 @@ for scenario in scenarios:
         and r.get("host") == host
     ]
     print(f"\n[{scenario}] {profile} on {host}")
+    for key in COUNTERS:
+        now = fresh.get(key)
+        before = same[-1].get(key) if same else None
+        if not isinstance(now, int) or not isinstance(before, int):
+            # Say so rather than skipping in silence: a record-only scenario
+            # never reaches the "no committed baseline row" failure below, so
+            # this line is the only sign the counter went unjudged.
+            if now is not None or before is not None:
+                print(f"  skip {key}: not comparable (now={now!r}, baseline={before!r})")
+            continue
+        verdict = "FAIL" if now > before else "ok"
+        if now > before:
+            failed = True
+        print(f"  {verdict:<4} {key:<18} {before:>14} -> {now:<14}")
+    if scenario in record_only:
+        # Printed with its delta, never judged: this scenario is accumulating
+        # spread, and the delta is what phase 2 reads to decide it has enough.
+        prev = same[-1] if same else {}
+        for key in METRICS:
+            now, before = fresh.get(key), prev.get(key)
+            comparable = (
+                isinstance(now, (int, float)) and isinstance(before, (int, float)) and before > 0
+            )
+            delta = f"{(now - before) / before * 100:+.1f}%" if comparable else "n/a"
+            shown_now = now if now is not None else "-"
+            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {shown_now:<14} {delta:>7}  (record-only)")
+        continue
     if not same:
         print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
         failed = True
