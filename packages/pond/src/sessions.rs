@@ -28,7 +28,7 @@ use lance::index::DatasetIndexExt;
 use lance::table::format::Fragment;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned, ser::SerializeMap};
 use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 
@@ -43,7 +43,10 @@ use crate::{
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
         TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, Message, Part, PartKind, Role, SUMMARY_PART_TYPES, Session, SessionFrom},
+    wire::{
+        FileData, Message, Part, PartKind, ProviderOptions, Role, SUMMARY_PART_TYPES, Session,
+        SessionFrom,
+    },
 };
 use url::Url;
 
@@ -1273,6 +1276,7 @@ impl Store {
             .flat_map(|substream| {
                 substream.messages.iter().map(|buffered| MessageBatchRow {
                     message: &buffered.message,
+                    pond_stamp: buffered.pond_stamp,
                     source_agent: &substream.session.source_agent,
                     project: &substream.session.project,
                     search_text: buffered.search_text.as_deref(),
@@ -1374,6 +1378,7 @@ impl Store {
             .iter()
             .map(|write| MessageBatchRow {
                 message: write.message,
+                pond_stamp: None,
                 source_agent: &session.source_agent,
                 project: &session.project,
                 search_text: write.search_text,
@@ -4305,6 +4310,7 @@ struct BufferedSession {
 struct BufferedMessage {
     index: usize,
     message: Message,
+    pond_stamp: Option<&'static Value>,
     parts: Vec<BufferedPart>,
     search_text: Option<String>,
     bytes: usize,
@@ -4397,6 +4403,19 @@ fn ingest_host_stamp() -> Option<&'static Value> {
         .as_ref()
 }
 
+/// What merging the host stamp into `options` at encode time adds to a
+/// message's serialized JSON: `"pond":`, the stamp, and a separating comma
+/// when other keys remain. Charging it here keeps the byte budget equal to the
+/// stamped event the flush actually encodes, without buffering a stamp copy.
+fn ingest_host_stamp_bytes(options: &ProviderOptions) -> usize {
+    static STAMP_BYTES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    STAMP_BYTES
+        .get_or_init(|| ingest_host_stamp().map(|stamp| stamp.to_string().len()))
+        .map_or(0, |stamp| {
+            r#""pond":"#.len() + stamp + usize::from(!options.is_empty())
+        })
+}
+
 impl IngestValidator {
     /// Drive one input event through the validator. Returns the per-row
     /// outcomes the event triggered: empty when the event is just buffered,
@@ -4409,23 +4428,17 @@ impl IngestValidator {
         index: usize,
         mut event: IngestEvent,
     ) -> Result<Vec<RowOutcome>> {
+        let mut stamp_bytes = 0;
         if let IngestEvent::Message(message) = &mut event {
             // `options.pond` is core-owned (spec.md#model-pond-options): stripped
-            // and restamped at ingest so neither adapters nor wire clients can
-            // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
-            // never restamps stored rows.
-            match ingest_host_stamp() {
-                Some(stamp) => {
-                    message
-                        .options_mut()
-                        .insert("pond".to_owned(), stamp.clone());
-                }
-                None => {
-                    message.options_mut().remove("pond");
-                }
-            }
+            // here and restamped once at encode time (`message_options_bytes`)
+            // so neither adapters nor wire clients can spoof provenance. Matched
+            // rows are merge_insert no-ops, so re-ingest never restamps stored rows.
+            let options = message.options_mut();
+            options.remove("pond");
+            stamp_bytes = ingest_host_stamp_bytes(options);
         }
-        let bytes = json_size(&event)?;
+        let bytes = json_size(&event)? + stamp_bytes;
         match event {
             IngestEvent::Session(session) => self.push_session(store, index, session, bytes).await,
             IngestEvent::Message(message) => Ok(self.push_message(index, message, bytes)),
@@ -4621,12 +4634,14 @@ impl IngestValidator {
                 DROP_REASON_DUPLICATE_MESSAGE_ID,
             )];
         }
+        let pond_stamp = ingest_host_stamp();
         self.flush_current_message();
         let bytes = bytes + message_row_fixed_bytes();
         self.buffered_bytes += bytes;
         self.current_message = Some(BufferedMessage {
             index,
             message,
+            pond_stamp,
             parts: Vec::new(),
             search_text: None,
             bytes,
@@ -5726,6 +5741,7 @@ pub(crate) fn empty_reader(
 
 pub(crate) struct MessageBatchRow<'a> {
     pub message: &'a Message,
+    pub pond_stamp: Option<&'static Value>,
     pub source_agent: &'a str,
     pub project: &'a str,
     pub search_text: Option<&'a str>,
@@ -5970,6 +5986,53 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
+struct StampedMessageOptions<'a> {
+    options: &'a ProviderOptions,
+    pond_stamp: &'a Value,
+}
+
+impl Serialize for StampedMessageOptions<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.options.len() + 1))?;
+        let mut wrote_stamp = false;
+        // `ProviderOptions` is a BTreeMap, so this walks keys in sorted order
+        // and emits the stamp at its sorted position. The position itself is
+        // not load-bearing (jsonb re-sorts on parse), but skipping an existing
+        // `pond` key is: it makes a duplicate key structurally impossible even
+        // if a caller ever hands us options the ingest strip did not clear.
+        for (key, value) in self.options {
+            if !wrote_stamp && key.as_str() >= "pond" {
+                map.serialize_entry("pond", self.pond_stamp)?;
+                wrote_stamp = true;
+                if key.as_str() == "pond" {
+                    continue;
+                }
+            }
+            map.serialize_entry(key, value)?;
+        }
+        if !wrote_stamp {
+            map.serialize_entry("pond", self.pond_stamp)?;
+        }
+        map.end()
+    }
+}
+
+fn message_options_bytes(row: &MessageBatchRow<'_>) -> Result<Vec<u8>> {
+    match row.pond_stamp {
+        Some(pond_stamp) => {
+            debug_assert!(!row.message.options().contains_key("pond"));
+            json_bytes(&StampedMessageOptions {
+                options: row.message.options(),
+                pond_stamp,
+            })
+        }
+        None => json_bytes(row.message.options()),
+    }
+}
+
 /// One `messages` batch covering `rows[start..end]`, returned with that `end`
 /// so the caller can walk a long row set without ever holding two chunks alive.
 /// `vectors` is aligned to `rows` (same length): `Some` carries the inline
@@ -5992,7 +6055,7 @@ fn messages_batch_from(
     let mut end = start;
     while end < rows.len() {
         let row = &rows[end];
-        let encoded = json_bytes(row.message.options())?;
+        let encoded = message_options_bytes(row)?;
         let columns = [
             row.message.session_id().len(),
             row.message.id().len(),
@@ -6842,6 +6905,7 @@ mod tests {
         };
         let row = MessageBatchRow {
             message: &message,
+            pond_stamp: None,
             source_agent: "claude-code",
             project: "/tmp",
             search_text: None,
@@ -7031,12 +7095,14 @@ mod tests {
         let rows = [
             MessageBatchRow {
                 message: &first,
+                pond_stamp: None,
                 source_agent: &session.source_agent,
                 project: &session.project,
                 search_text: None,
             },
             MessageBatchRow {
                 message: &second,
+                pond_stamp: None,
                 source_agent: &session.source_agent,
                 project: &session.project,
                 search_text: None,
@@ -7132,6 +7198,7 @@ mod tests {
             .iter()
             .map(|message| MessageBatchRow {
                 message,
+                pond_stamp: None,
                 source_agent: &session.source_agent,
                 project: &session.project,
                 search_text: None,
@@ -7740,6 +7807,108 @@ mod tests {
         assert_eq!(sessions, 1, "session committed");
         assert_eq!(messages, 1, "only the first message committed");
 
+        Ok(())
+    }
+
+    /// Pins that buffering shares one stamp instead of cloning it per message,
+    /// and that encoding still produces the bytes the old clone-and-insert path
+    /// produced. It does NOT pin the serializer's key placement: both sides go
+    /// through `json_bytes`, and jsonb sorts object keys on parse, so the
+    /// emitted text order is normalized away before the comparison.
+    #[tokio::test]
+    async fn buffered_messages_share_the_host_stamp_until_encoding() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("shared-host-stamp");
+        let message = |id: &str| Message::User {
+            id: id.to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::from([
+                ("alpha".to_owned(), json!(1)),
+                ("zulu".to_owned(), json!(2)),
+                ("pond".to_owned(), json!({"spoofed": true})),
+            ]),
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message("message-1")))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Message(message("message-2")))
+            .await?;
+
+        let first = &validator.messages[0];
+        let second = validator.current_message.as_ref().unwrap();
+        assert!(!first.message.options().contains_key("pond"));
+        assert!(!second.message.options().contains_key("pond"));
+        match (first.pond_stamp, second.pond_stamp) {
+            (Some(first), Some(second)) => assert!(std::ptr::eq(first, second)),
+            (None, None) => {}
+            stamps => panic!("buffered messages disagree on host stamp: {stamps:?}"),
+        }
+
+        let row = MessageBatchRow {
+            message: &first.message,
+            pond_stamp: first.pond_stamp,
+            source_agent: "claude-code",
+            project: "/tmp/pond",
+            search_text: None,
+        };
+        let encoded = message_options_bytes(&row)?;
+        let mut expected = first.message.options().clone();
+        if let Some(stamp) = first.pond_stamp {
+            expected.insert("pond".to_owned(), stamp.clone());
+        }
+        assert_eq!(encoded, json_bytes(&expected)?);
+        Ok(())
+    }
+
+    /// The stamp is merged in at encode time rather than buffered, but the byte
+    /// budget must still charge the event as it will be encoded: stamp included
+    /// exactly once, spoofed key excluded, with or without other option keys.
+    #[tokio::test]
+    async fn byte_budget_charges_the_host_stamp_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("stamp-bytes");
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        let cases = [
+            ProviderOptions::new(),
+            ProviderOptions::from([("pond".to_owned(), json!("spoofed"))]),
+            ProviderOptions::from([("alpha".to_owned(), json!(1))]),
+        ];
+        for (index, options) in cases.into_iter().enumerate() {
+            let message = Message::User {
+                id: format!("message-{index}"),
+                session_id: session.id.clone(),
+                timestamp: Utc::now(),
+                options,
+            };
+            let mut stamped = message.clone();
+            stamped.options_mut().remove("pond");
+            if let Some(stamp) = ingest_host_stamp() {
+                stamped
+                    .options_mut()
+                    .insert("pond".to_owned(), stamp.clone());
+            }
+            let before = validator.buffered_bytes;
+            validator
+                .push(&store, index + 1, IngestEvent::Message(message))
+                .await?;
+            assert_eq!(
+                validator.buffered_bytes - before,
+                json_size(&IngestEvent::Message(stamped))? + message_row_fixed_bytes(),
+                "case {index}",
+            );
+        }
         Ok(())
     }
 
