@@ -75,6 +75,12 @@ across commits, so a warm run is evaluation-free.
 - the kache prefix-vs-env assertion becomes a step in the dist job (or lives in
   the build-dist script, see 2.4).
 
+One-time cleanup once the bootstrap is gone: delete `/ci-cache/{proto,rustup,bin}`
+and the rustup proxies in `/ci-cache/cargo/bin` (keep the registry cache).
+This is required, not housekeeping - moon's rust plugin prepends
+`$CARGO_HOME/bin` to PATH, so leftover proxies would silently shadow the Nix
+rustc (the pitfall in 2.1).
+
 nix.conf on the runner (set on the ops side; recorded here for review):
 `http-connections = 50`, `max-substitution-jobs = 32`,
 `download-buffer-size = 268435456`, `narinfo-cache-negative-ttl = 0`,
@@ -97,6 +103,9 @@ there.
 - **Add `/flake.lock` to the hashed inputs** (shared fileGroups). With versions
   out of the config, nothing else ties task hashes to the toolchain; without
   this a toolchain bump silently reuses stale cached results.
+- **`hasher.optimization: 'performance'`**: skips parsing the (large)
+  `Cargo.lock` into every task hash; the lockfile stays a file input, so
+  dependency changes still invalidate.
 - **`build-and-test` switches to `moon ci`** (same targets): affected-only
   drops untouched suites before hashing, which removes the uncached `npm ci`
   runs on most PRs - likely most of the 10-15s hit-path. Full `fetch-depth: 0`
@@ -173,6 +182,9 @@ there.
   removes the checkout-before-local-action coupling where useful.
 - flake-check stays on ubuntu-latest (its ~30s is fine, and it is the
   unsandboxed-pod counterexample the comment already documents).
+- Label fact for future jobs: `macos-15` is arm64 - which matches the
+  aarch64-apple-darwin artifact macos-verify runs today; an Intel verify job
+  would need `macos-15-intel`/`macos-15-large`.
 
 ### 2.7 Binary cache (bucket and keys are managed privately)
 
