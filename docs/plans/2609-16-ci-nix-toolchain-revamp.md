@@ -228,4 +228,4 @@ The rationale and trust analysis live with the ops-side plan.
 | 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results |
 
 Phases 1-3 are independent of Nix entirely. Phase 5 is the only one touching
-the runner image and can roll back by reverting the image tag + helmfile.
+the runner image and can roll back by reverting the image tag on the ops side.
