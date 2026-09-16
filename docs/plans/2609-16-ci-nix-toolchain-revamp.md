@@ -63,6 +63,11 @@ One step at the top of each pond-ci job:
    `HOME`, `NIX_BUILD_TOP` and similar.
 
 Later steps run with zero Nix overhead (no `nix develop -c` wrappers).
+
+Design rule this depends on: **the devShell must not reference `self` or the
+source tree**. Its derivation then depends only on the three key files, which
+is what makes the profile key sound - and keeps the shell recipe identical
+across commits, so a warm run is evaluation-free.
 `bootstrap/action.yml` is deleted; its two survivors move:
 - the cache env exports (`CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME` gone,
   `PROTO_HOME` gone, npm/uv caches, `KACHE_CONFIG`, `KACHE_RUNTIME_DIR`) become
@@ -73,7 +78,10 @@ Later steps run with zero Nix overhead (no `nix develop -c` wrappers).
 nix.conf on the runner (set on the ops side; recorded here for review):
 `http-connections = 50`, `max-substitution-jobs = 32`,
 `download-buffer-size = 268435456`, `narinfo-cache-negative-ttl = 0`,
-`sandbox = false`, single-user store on its own PVC.
+`sandbox = false`, single-user store on its own PVC. Nix itself must be
+>= 2.35: lazy source copying stops each evaluated commit from writing the
+whole source tree into the store, and uploads/substitutions got parallel
+there.
 
 ### 2.3 moon
 
@@ -194,7 +202,8 @@ The rationale and trust analysis live with the ops-side plan.
   watch_file line a toolchain bump goes unnoticed).
 - Agents use `direnv exec . <cmd>` (or one `eval "$(direnv export bash)"` per
   shell) - never `nix develop -c` per command, which re-evaluates after every
-  file edit.
+  file edit. A worktree created outside the trusted prefixes (e.g. a scratch
+  dir) needs one `direnv allow` first.
 - **Local kache comes back**: `KACHE_PRESERVE_INCREMENTAL=1` (global config,
   not repo-level). Units that cargo passes `-C incremental` (workspace crates)
   skip the store and keep incremental; registry deps stay cached. This removes
@@ -215,6 +224,9 @@ The rationale and trust analysis live with the ops-side plan.
       nothing and use PATH.
 - [ ] `kache why-miss aws_lc_sys` for OUT_DIR-embedded `.a` contents.
 - [ ] moon background-upload inline-wait workaround still needed at 300s.
+- [ ] macOS devshell: `mkShell` brings the Darwin clang wrapper and apple-sdk
+      env - verify the `cc` crate and aws-lc-sys still build there, else use
+      `mkShellNoCC` on Darwin only.
 
 ## 4. Rollout order
 
