@@ -1115,9 +1115,9 @@ impl Store {
     ///      `SourceDedupeBehavior::FirstSeen` in `substrate::merge_insert`
     ///      (invariant 17): this layer's job is preserving substream merge
     ///      semantics, not policing the PK uniqueness Lance handles itself.
-    ///   3. Builds one combined `RecordBatch` per table (sessions, messages,
-    ///      parts) across every valid substream.
-    ///   4. Commits messages + parts first, then sessions. The session row is
+    ///   3. Encodes and appends messages in byte-bounded chunks while keeping
+    ///      the table's append routing intact.
+    ///   4. Commits messages + parts first, then finalized sessions. The session row is
     ///      the freshness-bearing row; writing it last makes a partial
     ///      non-atomic flush re-ingest and heal (spec.md#session-movement-complete).
     ///   5. Composes per-session [`RowOutcome`]s in original substream order.
@@ -1157,13 +1157,18 @@ impl Store {
                         "session re-submitted in one batch under different labels; \
                          keeping the first occurrence's and merging the rows under them"
                     );
-                    counts.relabeled_sessions += 1;
+                    if substream.session_index.is_some() {
+                        counts.relabeled_sessions += 1;
+                    }
                 }
                 // Same session, same metadata: merge messages. Dedup message
                 // ids defensively (within one batch, the validator's seen
                 // sets are per-substream so cross-substream dups can happen
                 // legally if both files re-emit the same row).
                 let existing = &mut merged[existing_idx];
+                if existing.session_index.is_none() {
+                    existing.session_index = substream.session_index;
+                }
                 let mut seen: std::collections::HashSet<String> = existing
                     .messages
                     .iter()
@@ -1234,7 +1239,9 @@ impl Store {
                 );
                 substream.session.source_agent = existing.source_agent.clone();
                 substream.session.project = existing.project.clone();
-                counts.relabeled_sessions += 1;
+                if substream.session_index.is_some() {
+                    counts.relabeled_sessions += 1;
+                }
             }
         }
 
@@ -1248,6 +1255,7 @@ impl Store {
         // id, and merge makes the loser's row a no-op instead of a duplicate.
         let sessions_owned: Vec<Session> = writeable
             .iter()
+            .filter(|substream| substream.session_index.is_some())
             .map(|substream| &substream.session)
             .filter(|session| !existing_sessions.contains_key(&session.id))
             .cloned()
@@ -1298,22 +1306,29 @@ impl Store {
             .embed_message_rows(&message_rows, &existing_message_pks)
             .await?;
 
-        let message_stream = tokio_stream::iter(
-            messages_batches(&message_rows, &message_vectors)?
-                .into_iter()
-                .map(Ok::<_, DataFusionError>),
-        );
         let part_stream = tokio_stream::iter(
             parts_batches(&part_rows)?
                 .into_iter()
                 .map(Ok::<_, DataFusionError>),
         );
+        let append_messages = async {
+            let mut appended = 0usize;
+            let mut start = 0usize;
+            while start < message_rows.len() {
+                let (end, batch) = messages_batch_from(&message_rows, &message_vectors, start)?;
+                appended += self
+                    .append_filtered(
+                        Table::Messages,
+                        tokio_stream::iter([Ok::<_, DataFusionError>(batch)]),
+                        Self::message_keep(existing_message_pks.clone()),
+                    )
+                    .await?;
+                start = end;
+            }
+            Ok::<_, anyhow::Error>(appended)
+        };
         let (_messages_appended, _parts_appended) = tokio::try_join!(
-            self.append_filtered(
-                Table::Messages,
-                message_stream,
-                Self::message_keep(existing_message_pks.clone()),
-            ),
+            append_messages,
             self.append_filtered(
                 Table::Parts,
                 part_stream,
@@ -1359,8 +1374,13 @@ impl Store {
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
-        let batches = messages_batches(&rows, &vec![None; rows.len()])?;
-        merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
+        let vectors = vec![None; rows.len()];
+        let mut start = 0usize;
+        while start < rows.len() {
+            let (end, batch) = messages_batch_from(&rows, &vectors, start)?;
+            merge_insert_chunks(&self.handle, Table::Messages, vec![batch]).await?;
+            start = end;
+        }
         Ok(())
     }
 
@@ -4137,6 +4157,7 @@ pub struct RowError {
 struct BufferedSession {
     index: usize,
     session: Session,
+    bytes: usize,
 }
 
 #[derive(Debug)]
@@ -4145,30 +4166,44 @@ struct BufferedMessage {
     message: Message,
     parts: Vec<BufferedPart>,
     search_text: Option<String>,
+    bytes: usize,
 }
 
 #[derive(Debug)]
 struct BufferedPart {
     index: usize,
     part: Part,
+    bytes: usize,
+}
+
+/// Caps buffered source bytes at 32 MiB, trading occasional extra commits for
+/// a bounded version of the roughly 10x transient amplification measured in #229.
+pub(crate) const INGEST_FLUSH_BYTE_BUDGET: usize = 32 << 20;
+
+/// Bytes a buffered message row costs downstream on top of its own payload:
+/// `embedding_columns` materializes a dense `embedding_dim()` x f16 slot per
+/// row plus an `embedding_model` offset even when every vector is null (the
+/// embedder-less ingest case), so the source JSON is not a complete proxy for
+/// what a flush allocates. Counting it keeps that buffer bounded by the flush
+/// window instead of letting it grow with the whole batch.
+fn message_row_fixed_bytes() -> usize {
+    embedding_dim() * size_of::<half::f16>() + size_of::<i32>()
 }
 
 /// State machine that turns the `events: Vec<IngestEvent>` array into a
-/// flat `Vec<RowOutcome>` matching the array's index space. Buffers a whole
-/// session substream so `merge_insert` runs once per substream (three
-/// batches: sessions, messages, parts). A validation error on a single event
-/// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
-/// continues; only Session-level invariants (immutable source_agent / project
-/// on re-write) drop the whole substream (spec.md#adapter-integrity-event-ordering).
+/// flat `Vec<RowOutcome>` matching the array's index space. A validation error
+/// on a single event drops *that event* (one [`OutcomeStatus::Error`] outcome)
+/// and the substream continues; only Session-level invariants (immutable
+/// source_agent / project on re-write) drop the whole substream
+/// (spec.md#adapter-integrity-event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the current one), they accumulate in
 /// `completed` rather than each one calling `merge_insert` immediately.
-/// The caller drains the buffer via [`Self::flush`] / [`Self::finish`],
-/// at which point one batched 3-parallel-merge-insert covers all pending
-/// substreams. This is the load-bearing perf change: per-substream commit
-/// overhead dominated the ingest profile (see `benches/ingest_bench.rs`),
-/// and amortizing it across N sessions cuts wall time materially.
+/// The caller drains the buffer via [`Self::flush`] / [`Self::finish`]. A flush
+/// may also write complete messages from the current substream while retaining
+/// its session row until close. Completed substreams remain batched because
+/// per-substream commit overhead dominates the ingest profile.
 #[derive(Debug, Default)]
 pub struct IngestValidator {
     session: Option<BufferedSession>,
@@ -4186,14 +4221,16 @@ pub struct IngestValidator {
     /// rows haven't been written yet. Flushed in batched mode by
     /// [`Self::flush`].
     completed: Vec<CompletedSubstream>,
+    buffered_bytes: usize,
 }
 
 /// One closed substream ready for the batched flush path.
 #[derive(Debug)]
 struct CompletedSubstream {
-    session_index: usize,
+    session_index: Option<usize>,
     session: Session,
     messages: Vec<BufferedMessage>,
+    bytes: usize,
 }
 
 /// Ingest host provenance (`options.pond`, spec.md#model-pond-options),
@@ -4229,12 +4266,29 @@ impl IngestValidator {
         &mut self,
         store: &Store,
         index: usize,
-        event: IngestEvent,
+        mut event: IngestEvent,
     ) -> Result<Vec<RowOutcome>> {
+        if let IngestEvent::Message(message) = &mut event {
+            // `options.pond` is core-owned (spec.md#model-pond-options): stripped
+            // and restamped at ingest so neither adapters nor wire clients can
+            // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
+            // never restamps stored rows.
+            match ingest_host_stamp() {
+                Some(stamp) => {
+                    message
+                        .options_mut()
+                        .insert("pond".to_owned(), stamp.clone());
+                }
+                None => {
+                    message.options_mut().remove("pond");
+                }
+            }
+        }
+        let bytes = json_size(&event)?;
         match event {
-            IngestEvent::Session(session) => self.push_session(store, index, session).await,
-            IngestEvent::Message(message) => Ok(self.push_message(index, message)),
-            IngestEvent::Part(part) => Ok(self.push_part(index, part)),
+            IngestEvent::Session(session) => self.push_session(store, index, session, bytes).await,
+            IngestEvent::Message(message) => Ok(self.push_message(index, message, bytes)),
+            IngestEvent::Part(part) => Ok(self.push_part(index, part, bytes)),
         }
     }
 
@@ -4247,17 +4301,38 @@ impl IngestValidator {
         self.flush(store).await
     }
 
-    /// Drain every completed substream into batched 3-parallel-merge_insert
-    /// writes. Caller invokes this periodically (every N completed
-    /// substreams) to keep memory bounded; in adapter-driven sync that
-    /// happens via the BATCH_SIZE check in `ingest_adapter`. The current
-    /// in-flight substream stays buffered - close it explicitly via
-    /// [`Self::finish`] or by feeding the next Session event.
+    /// Drain completed substreams plus complete messages from the in-flight
+    /// substream. Its session row stays buffered until the substream closes so
+    /// the freshness signal never outruns durable message and part rows.
     pub async fn flush(&mut self, store: &Store) -> Result<(Vec<RowOutcome>, BatchCounts)> {
-        if self.completed.is_empty() {
+        if self.completed.is_empty() && self.messages.is_empty() {
             return Ok((Vec::new(), BatchCounts::default()));
         }
-        let completed = std::mem::take(&mut self.completed);
+        let mut completed = std::mem::take(&mut self.completed);
+        if !self.messages.is_empty() {
+            let session = &self
+                .session
+                .as_ref()
+                .context("validator has complete messages without a session")?
+                .session;
+            let messages = std::mem::take(&mut self.messages);
+            completed.push(CompletedSubstream {
+                session_index: None,
+                session: session.clone(),
+                bytes: messages.iter().map(|message| message.bytes).sum(),
+                messages,
+            });
+        }
+        // Every buffered byte is charged once, against the same stored figure
+        // it was added under, so this is the sole subtraction site. The session
+        // row of a partial flush stays buffered and so stays charged.
+        let flushed_bytes: usize = completed.iter().map(|substream| substream.bytes).sum();
+        debug_assert!(
+            self.buffered_bytes >= flushed_bytes,
+            "buffered byte accounting underflowed: {} buffered, {flushed_bytes} flushed",
+            self.buffered_bytes,
+        );
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(flushed_bytes);
         store.upsert_session_batch(completed).await
     }
 
@@ -4267,11 +4342,19 @@ impl IngestValidator {
         self.completed.len()
     }
 
+    /// True when the byte bound is crossed and at least one complete message
+    /// or substream can be written without violating event ordering.
+    pub fn byte_budget_reached(&self) -> bool {
+        self.buffered_bytes >= INGEST_FLUSH_BYTE_BUDGET
+            && (!self.completed.is_empty() || !self.messages.is_empty())
+    }
+
     async fn push_session(
         &mut self,
         _store: &Store,
         index: usize,
         mut session: Session,
+        bytes: usize,
     ) -> Result<Vec<RowOutcome>> {
         // Close out the current substream (if any) - move it to the pending
         // buffer instead of writing immediately. The actual write happens
@@ -4321,7 +4404,12 @@ impl IngestValidator {
 
         self.seen_message_ids.clear();
         self.seen_part_keys.clear();
-        self.session = Some(BufferedSession { index, session });
+        self.buffered_bytes += bytes;
+        self.session = Some(BufferedSession {
+            index,
+            session,
+            bytes,
+        });
         Ok(Vec::new())
     }
 
@@ -4330,21 +4418,24 @@ impl IngestValidator {
         let Some(BufferedSession {
             index: session_index,
             session,
+            bytes: session_bytes,
         }) = self.session.take()
         else {
             return;
         };
         let messages = std::mem::take(&mut self.messages);
+        let bytes = session_bytes + messages.iter().map(|message| message.bytes).sum::<usize>();
         self.seen_message_ids.clear();
         self.seen_part_keys.clear();
         self.completed.push(CompletedSubstream {
-            session_index,
+            session_index: Some(session_index),
             session,
             messages,
+            bytes,
         });
     }
 
-    fn push_message(&mut self, index: usize, mut message: Message) -> Vec<RowOutcome> {
+    fn push_message(&mut self, index: usize, message: Message, bytes: usize) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(message.session_id().to_owned()),
             Value::String(message.id().to_owned()),
@@ -4389,31 +4480,20 @@ impl IngestValidator {
                 DROP_REASON_DUPLICATE_MESSAGE_ID,
             )];
         }
-        // `options.pond` is core-owned (spec.md#model-pond-options): stripped
-        // and restamped at ingest so neither adapters nor wire clients can
-        // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
-        // never restamps stored rows.
-        match ingest_host_stamp() {
-            Some(stamp) => {
-                message
-                    .options_mut()
-                    .insert("pond".to_owned(), stamp.clone());
-            }
-            None => {
-                message.options_mut().remove("pond");
-            }
-        }
         self.flush_current_message();
+        let bytes = bytes + message_row_fixed_bytes();
+        self.buffered_bytes += bytes;
         self.current_message = Some(BufferedMessage {
             index,
             message,
             parts: Vec::new(),
             search_text: None,
+            bytes,
         });
         Vec::new()
     }
 
-    fn push_part(&mut self, index: usize, part: Part) -> Vec<RowOutcome> {
+    fn push_part(&mut self, index: usize, part: Part, bytes: usize) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(part.session_id.clone()),
             Value::String(part.message_id.clone()),
@@ -4476,7 +4556,8 @@ impl IngestValidator {
                 DROP_REASON_DUPLICATE_PART_KEY,
             )];
         }
-        self.current_parts.push(BufferedPart { index, part });
+        self.buffered_bytes += bytes;
+        self.current_parts.push(BufferedPart { index, part, bytes });
         Vec::new()
     }
 
@@ -4490,6 +4571,9 @@ impl IngestValidator {
             canonical_parts.push(part.part.clone());
         }
         buffered.search_text = search_text(&buffered.message, &canonical_parts);
+        let derived_bytes = buffered.search_text.as_deref().map_or(0, str::len);
+        buffered.bytes += parts.iter().map(|part| part.bytes).sum::<usize>() + derived_bytes;
+        self.buffered_bytes += derived_bytes;
         buffered.parts = parts;
         self.messages.push(buffered);
     }
@@ -4523,7 +4607,7 @@ fn error_outcome(
 /// Also accumulates the per-table totals into `counts` so the CLI summary
 /// gets the same truth without re-walking the outcomes.
 fn success_outcomes_for_substream(
-    session_index: usize,
+    session_index: Option<usize>,
     session: &Session,
     messages: &[BufferedMessage],
     existing_sessions: &std::collections::HashMap<String, Session>,
@@ -4531,23 +4615,23 @@ fn success_outcomes_for_substream(
     existing_part_pks: &HashSet<(String, String, String)>,
     counts: &mut BatchCounts,
 ) -> Vec<RowOutcome> {
-    let session_was_present = existing_sessions.contains_key(&session.id);
-    let session_status = if session_was_present {
-        counts.sessions_matched += 1;
-        UpsertStatus::Matched
-    } else {
-        counts.sessions_inserted += 1;
-        UpsertStatus::Inserted
-    };
-
-    let mut outcomes = Vec::with_capacity(1 + messages.len());
-    outcomes.push(success_outcome(
-        session_index,
-        "session",
-        Value::String(session.id.clone()),
-        session_status,
-        false,
-    ));
+    let mut outcomes = Vec::with_capacity(usize::from(session_index.is_some()) + messages.len());
+    if let Some(session_index) = session_index {
+        let session_status = if existing_sessions.contains_key(&session.id) {
+            counts.sessions_matched += 1;
+            UpsertStatus::Matched
+        } else {
+            counts.sessions_inserted += 1;
+            UpsertStatus::Inserted
+        };
+        outcomes.push(success_outcome(
+            session_index,
+            "session",
+            Value::String(session.id.clone()),
+            session_status,
+            false,
+        ));
+    }
     for buffered in messages {
         let key = (
             buffered.message.session_id().to_owned(),
@@ -5532,7 +5616,7 @@ fn embedding_update_schema() -> Arc<Schema> {
 
 /// The `messages` `vector` + `embedding_model` columns for an inline-embed
 /// batch: `Some` rows carry the embedding and the current model id, `None` rows
-/// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
+/// are null in both. Returned aligned to `vectors` for [`messages_batch_from`].
 fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
     let dim = embedding_dim();
     // The common case (no embedder, or every row already present) is all-null:
@@ -5614,10 +5698,12 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
     .context("failed to build embedding update batch")
 }
 
-/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
-/// is split before the running total of its text columns reaches this, and a
-/// single cell at or above it is rejected rather than left to panic inside
-/// `StringArray::from` (spec.md#adapter-bounded-values).
+/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a `sessions` or
+/// `parts` batch is split before the running total of its text columns reaches
+/// this, and a single cell at or above it is rejected rather than left to panic
+/// inside `StringArray::from` (spec.md#adapter-bounded-values). `messages` cuts
+/// on the far smaller [`INGEST_FLUSH_BYTE_BUDGET`] in [`messages_batch_from`]
+/// and so clears this wall by construction.
 const COLUMN_BYTE_BUDGET: usize = 1 << 30;
 
 /// Contiguous row ranges whose summed text-column byte cost each stays within
@@ -5743,19 +5829,29 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
+/// One `messages` batch covering `rows[start..end]`, returned with that `end`
+/// so the caller can walk a long row set without ever holding two chunks alive.
 /// `vectors` is aligned to `rows` (same length): `Some` carries the inline
 /// embedding for that row, `None` writes a null `vector`/`embedding_model`.
-pub(crate) fn messages_batches(
+///
+/// The cut is `INGEST_FLUSH_BYTE_BUDGET` over the row's text columns plus
+/// [`message_row_fixed_bytes`] - the dense vector slot `messages_chunk` pays per
+/// row even when every vector is null, which is what makes an unchunked batch
+/// expensive. `guard_cell` still rejects a single cell at Arrow's `i32` wall;
+/// below that, a row wider than the whole budget takes a chunk of its own rather
+/// than stalling, so `end > start` whenever `start < rows.len()`.
+fn messages_batch_from(
     rows: &[MessageBatchRow<'_>],
     vectors: &[Option<Vec<f32>>],
-) -> Result<Vec<RecordBatch>> {
+    start: usize,
+) -> Result<(usize, RecordBatch)> {
     debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
-    let options = rows
-        .iter()
-        .map(|row| json_bytes(row.message.options()))
-        .collect::<Result<Vec<_>>>()?;
-    let mut cells = Vec::with_capacity(rows.len());
-    for (row, encoded) in rows.iter().zip(&options) {
+    let mut options = Vec::new();
+    let mut running = 0usize;
+    let mut end = start;
+    while end < rows.len() {
+        let row = &rows[end];
+        let encoded = json_bytes(row.message.options())?;
         let columns = [
             row.message.session_id().len(),
             row.message.id().len(),
@@ -5769,18 +5865,16 @@ pub(crate) fn messages_batches(
         for bytes in columns {
             guard_cell("messages", row.message.id(), bytes)?;
         }
-        cells.push(columns.iter().sum());
+        let row_bytes = columns.iter().sum::<usize>() + message_row_fixed_bytes();
+        if running + row_bytes > INGEST_FLUSH_BYTE_BUDGET && end > start {
+            break;
+        }
+        running += row_bytes;
+        options.push(encoded);
+        end += 1;
     }
-    chunk_ranges(&cells)
-        .into_iter()
-        .map(|range| {
-            messages_chunk(
-                &rows[range.clone()],
-                &options[range.clone()],
-                &vectors[range],
-            )
-        })
-        .collect()
+    let batch = messages_chunk(&rows[start..end], &options, &vectors[start..end])?;
+    Ok((end, batch))
 }
 
 fn messages_chunk(
@@ -5788,6 +5882,7 @@ fn messages_chunk(
     options: &[Vec<u8>],
     vectors: &[Option<Vec<f32>>],
 ) -> Result<RecordBatch> {
+    debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
     let schema = message_schema();
     let (vector_column, embedding_model) = embedding_columns(vectors)?;
     RecordBatch::try_new(
@@ -6259,6 +6354,26 @@ fn micros(timestamp: DateTime<Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
 
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_size<T: Serialize>(value: &T) -> Result<usize> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).context("failed to measure JSON value")?;
+    Ok(counter.0)
+}
+
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // Write JSONB bytes (not plain UTF-8 JSON text) so the on-disk encoding
     // matches the `lance.json` extension contract. Lance's compact path
@@ -6377,6 +6492,21 @@ mod tests {
             project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
+    }
+
+    fn padded_message(session_id: &str, id: &str, payload_bytes: usize) -> Message {
+        let mut options = ProviderOptions::new();
+        options.insert("payload".to_owned(), json!("x".repeat(payload_bytes)));
+        Message::User {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp: Utc::now(),
+            options,
+        }
+    }
+
+    fn large_message(session_id: &str, id: &str) -> Message {
+        padded_message(session_id, id, INGEST_FLUSH_BYTE_BUDGET / 2 + 1024)
     }
 
     /// Counts the texts handed to the backend so a test can assert how many rows
@@ -6506,14 +6636,14 @@ mod tests {
             project: "/tmp",
             search_text: None,
         };
-        let batches = messages_batches(&[row], &[None])?;
+        let (_, batch) = messages_batch_from(&[row], &[None], 0)?;
         store
             .handle
-            .append_batches(Table::Messages, batches.clone())
+            .append_batches(Table::Messages, vec![batch.clone()])
             .await?;
         store
             .handle
-            .append_batches(Table::Messages, batches)
+            .append_batches(Table::Messages, vec![batch])
             .await?;
         assert_eq!(
             duplicates(&store, Table::Messages).await?,
@@ -6676,6 +6806,245 @@ mod tests {
             chunk_ranges(&[10, COLUMN_BYTE_BUDGET + 1, 10]),
             vec![0..1, 1..2, 2..3],
         );
+    }
+
+    #[tokio::test]
+    async fn byte_budget_flushes_complete_messages_from_an_in_flight_session() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("large-partial-flush");
+        let mut validator = IngestValidator::default();
+        let first = large_message(&session.id, "message-1");
+        let second = large_message(&session.id, "message-2");
+
+        let rows = [
+            MessageBatchRow {
+                message: &first,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            },
+            MessageBatchRow {
+                message: &second,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            },
+        ];
+        let (end, first_batch) = messages_batch_from(&rows, &[None, None], 0)?;
+        assert_eq!(end, 1);
+        assert_eq!(first_batch.num_rows(), 1);
+        drop(first_batch);
+
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(first))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Message(second))
+            .await?;
+
+        assert!(validator.byte_budget_reached());
+        let (outcomes, counts) = validator.flush(&store).await?;
+        assert_eq!(counts.sessions_inserted, 0);
+        assert_eq!(counts.messages_inserted_total, 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].kind, "message");
+        assert_eq!(store.row_counts().await?, (0, 1, 0));
+
+        let (_, final_counts) = validator.finish(&store).await?;
+        assert_eq!(final_counts.sessions_inserted, 1);
+        assert_eq!(final_counts.messages_inserted_total, 1);
+        let mut summary = IngestSummary::default();
+        summary.add_batch(&counts);
+        summary.add_batch(&final_counts);
+        assert_eq!(summary.sessions_inserted, 1);
+        assert_eq!(summary.messages_inserted_total, 2);
+        assert_eq!(store.row_counts().await?, (1, 2, 0));
+        Ok(())
+    }
+
+    /// A batch of modest messages allocates a dense all-null vector slot per row
+    /// that `json_size` cannot see, so the source bytes alone are not a complete
+    /// flush-size proxy. Here the JSON stays well under the budget while the
+    /// counted vector width is what trips the flush.
+    #[tokio::test]
+    async fn byte_budget_counts_the_fixed_vector_width_per_message() -> anyhow::Result<()> {
+        const PAYLOAD_BYTES: usize = 512;
+
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("vector-width-budget");
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+
+        let probe = padded_message(&session.id, "probe", PAYLOAD_BYTES);
+        let per_message = json_size(&IngestEvent::Message(probe))? + message_row_fixed_bytes();
+        let count = INGEST_FLUSH_BYTE_BUDGET.div_ceil(per_message);
+        for index in 0..count {
+            let message = padded_message(&session.id, &format!("message-{index}"), PAYLOAD_BYTES);
+            validator
+                .push(&store, index + 1, IngestEvent::Message(message))
+                .await?;
+        }
+
+        assert!(validator.byte_budget_reached());
+        let source_bytes = validator.buffered_bytes - count * message_row_fixed_bytes();
+        assert!(
+            source_bytes < INGEST_FLUSH_BYTE_BUDGET,
+            "source bytes alone ({source_bytes}) must stay under the budget"
+        );
+
+        let (_, counts) = validator.flush(&store).await?;
+        assert_eq!(counts.messages_inserted_total, count - 1);
+        Ok(())
+    }
+
+    /// The chunk cut carries the fixed vector width too, not just the flush
+    /// trigger: `messages_chunk` pays a dense `embedding_dim()` slot per row
+    /// however light the text columns are. These rows are small enough that
+    /// their text alone would fit in one chunk many times over, so only the
+    /// counted vector width can force the split.
+    #[test]
+    fn messages_batch_from_cuts_on_the_fixed_vector_width() -> anyhow::Result<()> {
+        const ROWS: usize = 50_000;
+
+        let session = synthetic_session("vector-width-chunking");
+        let messages: Vec<Message> = (0..ROWS)
+            .map(|index| padded_message(&session.id, &format!("message-{index}"), 0))
+            .collect();
+        let rows: Vec<MessageBatchRow<'_>> = messages
+            .iter()
+            .map(|message| MessageBatchRow {
+                message,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            })
+            .collect();
+        let vectors = vec![None; rows.len()];
+
+        let (end, batch) = messages_batch_from(&rows, &vectors, 0)?;
+        assert!(end < ROWS, "{ROWS} rows must not fit one chunk, got {end}");
+        assert_eq!(batch.num_rows(), end);
+        assert!(
+            end * message_row_fixed_bytes() > INGEST_FLUSH_BYTE_BUDGET / 2,
+            "the vector width must be what fills the chunk, got {end} rows",
+        );
+        Ok(())
+    }
+
+    /// Every byte charged to `buffered_bytes` must be discharged by the flush
+    /// that writes the row it was charged for. A missing subtraction leaks the
+    /// budget upward until ingest flushes on every event; a missing addition
+    /// trips the underflow assert inside `flush`.
+    #[tokio::test]
+    async fn flush_discharges_every_buffered_byte() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut validator = IngestValidator::default();
+        for (index, event) in conversational_events("byte-accounting", 8)
+            .into_iter()
+            .enumerate()
+        {
+            validator.push(&store, index, event).await?;
+        }
+        assert!(validator.buffered_bytes > 0);
+
+        // Mid-stream: the still-open session row and the in-flight message stay
+        // charged, everything the flush wrote does not.
+        validator.flush(&store).await?;
+        assert!(validator.buffered_bytes > 0);
+
+        validator.finish(&store).await?;
+        assert_eq!(validator.buffered_bytes, 0);
+        Ok(())
+    }
+
+    /// A partial flush writes its message rows under the stored labels but no
+    /// session row, so the relabel it detects belongs to the substream's close,
+    /// not to both.
+    #[tokio::test]
+    async fn partial_flush_counts_a_relabel_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let stored = synthetic_session("relabel-partial-flush");
+        let mut seed = IngestValidator::default();
+        seed.push(&store, 0, IngestEvent::Session(stored.clone()))
+            .await?;
+        seed.finish(&store).await?;
+
+        let mut relabeled = stored.clone();
+        relabeled.source_agent = "codex".to_owned();
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(relabeled.clone()))
+            .await?;
+        for (index, id) in ["message-1", "message-2"].into_iter().enumerate() {
+            validator
+                .push(
+                    &store,
+                    index + 1,
+                    IngestEvent::Message(large_message(&relabeled.id, id)),
+                )
+                .await?;
+        }
+        assert!(validator.byte_budget_reached());
+
+        let (_, partial) = validator.flush(&store).await?;
+        let (_, tail) = validator.finish(&store).await?;
+        assert_eq!(partial.relabeled_sessions, 0);
+        assert_eq!(tail.relabeled_sessions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resync_after_partial_flush_does_not_duplicate_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("large-partial-resync");
+
+        for pass in 0..2 {
+            let mut validator = IngestValidator::default();
+            validator
+                .push(&store, 0, IngestEvent::Session(session.clone()))
+                .await?;
+            validator
+                .push(
+                    &store,
+                    1,
+                    IngestEvent::Message(large_message(&session.id, "message-1")),
+                )
+                .await?;
+            validator
+                .push(
+                    &store,
+                    2,
+                    IngestEvent::Message(large_message(&session.id, "message-2")),
+                )
+                .await?;
+            assert!(validator.byte_budget_reached());
+
+            let (_, partial) = validator.flush(&store).await?;
+            let (_, final_counts) = validator.finish(&store).await?;
+            if pass == 0 {
+                assert_eq!(partial.messages_inserted_total, 1);
+                assert_eq!(final_counts.sessions_inserted, 1);
+                assert_eq!(final_counts.messages_inserted_total, 1);
+            } else {
+                assert_eq!(partial.messages_matched_total, 1);
+                assert_eq!(final_counts.sessions_matched, 1);
+                assert_eq!(final_counts.messages_matched_total, 1);
+            }
+        }
+
+        assert_eq!(store.row_counts().await?, (1, 2, 0));
+        Ok(())
     }
 
     #[tokio::test]
