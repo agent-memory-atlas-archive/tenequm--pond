@@ -4430,11 +4430,13 @@ async fn run_sync_stages(
 /// A cold sync builds the resident map with one sequential scan, while a warm
 /// sync delta-extends it - never the per-manifest version-resolution storm that
 /// throttled remote syncs to a stall. If another local process owns that build,
-/// the store-validated cursor covers the restart gap; with neither, the empty
-/// map yields no watermark and every source re-reads (safe, just slower).
+/// [`Store::sync_rowmap_oracle`] falls back to a validated trailing map (this
+/// process's resident one, else the newest valid cached chain), and failing
+/// that the store-validated cursor covers the restart gap. With none of them
+/// the empty map yields no watermark and every source re-reads (safe, just
+/// slower).
 async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::SkipOracle> {
-    ensure_rowmap_with_spinner(store, quiet).await;
-    let rowmap = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+    let rowmap = sync_rowmap_oracle_with_spinner(store, quiet).await;
     if rowmap.0.is_some() {
         return Box::new(rowmap);
     }
@@ -4468,11 +4470,13 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
     if !messages_changed && syncstate::sync_cursor_exists(store_key) {
         return;
     }
-    // Store-derived or nothing: a watermark that outran the store would drop
-    // messages, so a run that lost the map-build race leaves the old cursor
-    // alone rather than guessing. It stays behind until a run wins that race,
-    // which costs re-reads and never correctness.
-    let Some(rowmap) = store.rowmap_snapshot() else {
+    // Exactly the map this run planned against: a watermark that outran the
+    // store would drop messages, and a run whose chain the planner rejected has
+    // nothing to say, so it leaves the old cursor alone rather than guessing. A
+    // trailing map is store-validated and can only be behind, which costs
+    // re-reads and never correctness - so the contended run this cursor exists
+    // for still leaves one behind instead of racing the prewarm that outbid it.
+    let Some(rowmap) = store.sync_oracle_snapshot() else {
         return;
     };
     let Ok(probe) = store.message_store_probe().await else {
@@ -5071,10 +5075,14 @@ async fn wait_for_sync_lock(
     }
 }
 
-/// `ensure_rowmap` with a live spinner. On a fresh host against a populated
-/// remote store this is a one-time full scan of the messages table - the
-/// silent minutes-long "hang" of a first sync before it had a face.
-async fn ensure_rowmap_with_spinner(store: &Store, quiet: bool) {
+/// Build or select the sync rowmap oracle with a live spinner. On a fresh host
+/// against a populated remote store this is a one-time full scan of the
+/// messages table - the silent minutes-long "hang" of a first sync before it
+/// had a face.
+async fn sync_rowmap_oracle_with_spinner(
+    store: &Store,
+    quiet: bool,
+) -> pond::sessions::RowmapOracle {
     let started = std::time::Instant::now();
     let spinner = if quiet {
         ProgressBar::hidden()
@@ -5088,11 +5096,16 @@ async fn ensure_rowmap_with_spinner(store: &Store, quiet: bool) {
         .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
-        tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
-    }
+    let rowmap = match store.sync_rowmap_oracle(&default_cache_dir()).await {
+        Ok(rowmap) => rowmap,
+        Err(error) => {
+            tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
+            pond::sessions::RowmapOracle(None)
+        }
+    };
     spinner.finish_and_clear();
     tracing::debug!(target: "pond::perf", stage = "ensure_rowmap", elapsed_ms = started.elapsed().as_millis() as u64, "sync stage");
+    rowmap
 }
 
 /// Shared slot connecting the store's inline-embed progress callback to
