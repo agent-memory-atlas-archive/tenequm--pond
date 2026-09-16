@@ -429,8 +429,8 @@ struct StoreArgs {
         help = CONFIG_FILE_HELP
     )]
     config: Option<PathBuf>,
-    /// Directory holding pond's per-host state: the sync lock, the last-sync
-    /// record, and the scheduler log. Must be absolute. The argument form of
+    /// Directory holding pond's per-host state: the sync lock, sync cursor,
+    /// last-sync record, and scheduler log. Must be absolute. The argument form of
     /// `XDG_STATE_HOME`; hidden because the scheduler bakes it into a task
     /// rather than anyone typing it.
     #[arg(long = "state-dir", global = true, hide = true, value_name = "PATH")]
@@ -4321,6 +4321,9 @@ async fn in_serve_sync_once(
         &flush_hud,
     )
     .await;
+    if outcome.is_ok() {
+        persist_sync_cursor(store, report.ingest.messages_inserted_total > 0).await;
+    }
     let duration = started.elapsed();
     syncstate::write_last_sync(
         &store_key,
@@ -4405,7 +4408,7 @@ async fn run_sync_stages(
         }
     }
 
-    run_sync_pipeline(
+    let outcome = run_sync_pipeline(
         &store,
         loaded,
         config_file,
@@ -4414,7 +4417,77 @@ async fn run_sync_stages(
         report,
         &flush_hud,
     )
-    .await
+    .await;
+    if outcome.is_ok() {
+        persist_sync_cursor(&store, report.ingest.messages_inserted_total > 0).await;
+    }
+    outcome
+}
+
+/// The freshness oracle an import runs against, shared by the real sync and by
+/// `--dry-run` so the preview can never disagree with what sync would skip.
+///
+/// A cold sync builds the resident map with one sequential scan, while a warm
+/// sync delta-extends it - never the per-manifest version-resolution storm that
+/// throttled remote syncs to a stall. If another local process owns that build,
+/// the store-validated cursor covers the restart gap; with neither, the empty
+/// map yields no watermark and every source re-reads (safe, just slower).
+async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::SkipOracle> {
+    ensure_rowmap_with_spinner(store, quiet).await;
+    let rowmap = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+    if rowmap.0.is_some() {
+        return Box::new(rowmap);
+    }
+    match usable_sync_cursor(store).await {
+        Some(cursor) => Box::new(cursor),
+        None => Box::new(rowmap),
+    }
+}
+
+async fn usable_sync_cursor(store: &Store) -> Option<syncstate::SyncCursor> {
+    let store_key = &store.store_key();
+    let cursor = syncstate::read_sync_cursor(store_key)?;
+    let current_version = store.messages_version().await.ok()?;
+    let probe = store.message_store_probe().await.ok()?;
+    if cursor.messages_version <= current_version
+        && cursor.row_count <= probe.row_count
+        && cursor.oldest_messages == probe.oldest_messages
+    {
+        return Some(cursor);
+    }
+    tracing::warn!(
+        store = store_key,
+        "sync cursor describes a different store; discarding it"
+    );
+    syncstate::remove_sync_cursor(store_key);
+    None
+}
+
+async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
+    let store_key = &store.store_key();
+    if !messages_changed && syncstate::sync_cursor_exists(store_key) {
+        return;
+    }
+    // Store-derived or nothing: a watermark that outran the store would drop
+    // messages, so a run that lost the map-build race leaves the old cursor
+    // alone rather than guessing. It stays behind until a run wins that race,
+    // which costs re-reads and never correctness.
+    let Some(rowmap) = store.rowmap_snapshot() else {
+        return;
+    };
+    let Ok(probe) = store.message_store_probe().await else {
+        tracing::warn!(store = store_key, "failed to inspect store for sync cursor");
+        return;
+    };
+    syncstate::write_sync_cursor(
+        store_key,
+        &syncstate::SyncCursor {
+            messages_version: rowmap.version(),
+            row_count: rowmap.len(),
+            oldest_messages: probe.oldest_messages,
+            watermarks: rowmap.session_watermarks(),
+        },
+    );
 }
 
 /// The store-agnostic sync core, shared by the `pond sync` verb (which opens
@@ -4777,17 +4850,14 @@ async fn run_sync_dry_run(
         return Ok(());
     }
     let (_, store) = open_store(storage_path, loaded, true, false).await?;
-    let noop = pond::adapter::NoopOracle;
-    let rowmap_oracle;
-    let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
-        &noop
+    // The same oracle a real sync would resolve, so the preview matches what
+    // sync would actually skip - including the cursor fallback.
+    let oracle = if invocation.verify {
+        Box::new(pond::adapter::NoopOracle) as Box<dyn pond::adapter::SkipOracle>
     } else {
-        // The same freshness map a real sync would use, so the preview
-        // matches what sync would actually skip.
-        ensure_rowmap_with_spinner(&store, false).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
-        &rowmap_oracle
+        sync_skip_oracle(&store, false).await
     };
+    let oracle = oracle.as_ref();
     /// Why this adapter could not be counted. An adapter that cannot read
     /// part of its source reports an error rather than a count, and the
     /// point of a dry run is to see the whole picture - so it becomes a
@@ -5192,23 +5262,16 @@ async fn run_import_stage(
     // idempotent merge. This is the only path that heals historical M1 damage -
     // a session partially flushed before the commit-row-last fix keeps a frozen
     // watermark that mtime can never re-read past (spec.md#session-movement-complete).
-    let noop = pond::adapter::NoopOracle;
-    let rowmap_oracle;
-    let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
+    let oracle = if invocation.verify {
         output_err(&pond::output::paint(
             "import: --verify: re-reading every source body, bypassing the freshness skip",
             pond::output::yellow(),
         ))?;
-        &noop
+        Box::new(pond::adapter::NoopOracle) as Box<dyn pond::adapter::SkipOracle>
     } else {
-        // Freshness key from the resident meta map: a cold sync builds it with one
-        // sequential scan, a warm sync delta-extends it - never the per-manifest
-        // version-resolution storm that throttled remote syncs to a stall. A
-        // missing/stale map yields no key, so the session simply re-reads (safe).
-        ensure_rowmap_with_spinner(store, quiet).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
-        &rowmap_oracle
+        sync_skip_oracle(store, quiet).await
     };
+    let oracle = oracle.as_ref();
     // Set expectations up front on the one run that is genuinely long: a first
     // sync reads (and, with embedding enabled, embeds) the full history.
     // `--verify` (also an empty oracle) already announced itself above.
