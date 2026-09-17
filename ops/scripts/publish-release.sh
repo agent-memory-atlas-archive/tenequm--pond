@@ -36,6 +36,29 @@ cat dist/checksums.txt
 # plain retry with "already exists", so each try first clears it. The skip
 # compares GitHub's asset digest, not size: checksums.txt is the same size in
 # every release.
+#
+# The timeouts are sized against the job's own `timeout-minutes`, not against a
+# healthy upload: `--max-time` alone caps total duration, so a transfer crawling
+# at 13 KB/s counts as progress and burns the whole budget before retrying. Three
+# tries at the old 600s was a 31m30s worst case for ONE of five assets, inside a
+# 30-minute job that also runs release-plz - and the job dying there leaves the
+# tag cut and the crate published with no flake commit and no tap push.
+# `--speed-limit`/`--speed-time` abandon a dead link instead, and `--max-time`
+# 180 caps each try at 10m30s per asset across all three.
+#
+# `--speed-time 60`, not 30: curl's throughput average decays to zero within a
+# few seconds of the last byte, so the window also covers the time GitHub spends
+# processing a fully received upload before it answers. At 30 the 81 MB zip had
+# ~35s to be acknowledged or a COMPLETE upload was abandoned and re-sent.
+# Doubling it is free in the worst case - `--max-time` is the real bound - and
+# only slows dead-link detection from ~35s to ~65s.
+#
+# Note what `--max-time 180` really asks of the 81 MB zip: 450 KB/s sustained,
+# well above the 100 KB/s floor `--speed-limit` names. A steady 200 KB/s passes
+# the stall check and still dies at max-time. That is deliberate: a hosted runner
+# that cannot hold 450 KB/s to uploads.github.com is having an outage, and
+# failing the tail fast (it is idempotent - "Re-run failed jobs" resumes) beats
+# being SIGKILLed by the job timeout somewhere in the middle of it.
 release_id=$(gh api "repos/$repo/releases/tags/$tag" --jq .id)
 upload() {
   local f=$1 name want try existing id state digest present
@@ -58,13 +81,27 @@ upload() {
         echo "$name: already uploaded"
         return 0
       fi
-      if curl -sS --fail-with-body --max-time 600 -o /dev/null \
-        -H "Authorization: Bearer $GH_TOKEN" \
-        -H "Content-Type: application/octet-stream" \
-        --data-binary "@$f" \
-        "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$name"; then
+      # The token goes in on stdin (`-H @-`), never as an argument: an argv
+      # header is world-readable in `ps` for the whole upload, and a routine ps
+      # on a stalled upload is exactly how it leaked once.
+      # Truncated first: curl creates the -o file only once bytes arrive, so a
+      # connect-stage failure would otherwise reprint the previous asset's body.
+      : > "$tmp/upload.body"
+      if printf 'Authorization: Bearer %s\n' "$GH_TOKEN" \
+        | curl -sS --fail-with-body --max-time 180 \
+          --speed-limit 100000 --speed-time 60 \
+          -o "$tmp/upload.body" -H @- \
+          -H "Content-Type: application/octet-stream" \
+          --data-binary "@$f" \
+          "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$name"; then
         echo "$name: uploaded"
         return 0
+      fi
+      # GitHub's error text is in the body; `-o /dev/null` used to discard it,
+      # so a 500 or a 422 logged nothing but curl's exit code.
+      if [ -s "$tmp/upload.body" ]; then
+        head -c 2000 "$tmp/upload.body"
+        echo
       fi
     fi
     echo "::warning::$name: upload try $try failed"
