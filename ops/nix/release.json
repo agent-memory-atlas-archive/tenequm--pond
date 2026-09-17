@@ -1,0 +1,8 @@
+{
+  "version": "0.18.0",
+  "hashes": {
+    "x86_64-linux": "afa2475309e9b5ff388a4c82222dacb1f604b65892976a1a7b39ef48cc4ceda4",
+    "aarch64-linux": "928c9a8079fc9efcbe780915c47a50531b4bf23e2a835564e67a4aad1e9c2567",
+    "aarch64-darwin": "4bd5c3a9e10e40b77c254418dca94b6b99b5ed801fa2120b9a8769d641a85d18"
+  }
+}
