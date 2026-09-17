@@ -20,11 +20,9 @@ fileGroups:
     - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'
-    # Declared for what it is about to pin, not for what it pins today - see
-    # the same entry in the root moon.yml. CI's compiler still comes from
-    # rust-toolchain.toml above and its protoc from the bootstrap, so a protoc
-    # bump still moves no declared input; the nix-toolchain phase is what makes
-    # this line load-bearing.
+    # The devShell's nixpkgs-resolved tools (zig, the C compiler, cmake) - see
+    # the same entry in the root moon.yml, including why a protoc bump, which
+    # edits flake.nix only, still moves no declared input.
     - '/flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with

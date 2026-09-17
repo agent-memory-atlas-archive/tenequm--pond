@@ -20,15 +20,14 @@ fileGroups:
     - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
-    # Declared for what it is about to pin, not for what it pins today. The
-    # flake supplies only the `nix develop` cmake/protobuf/pkg-config; CI's
-    # compiler comes from rust-toolchain.toml (above), its protoc from the
-    # bootstrap's PROTOC_VERSION, and zig from the pond-runner image - none of
-    # which move this lock. So the gap it reads as closing, a toolchain bump
-    # replaying results built by the previous toolchain, is still open for
-    # protoc and zig. Here because the nix-toolchain phase makes the claim true
-    # and this way that lands as one edit; three commits in the repo's life, so
-    # the invalidation costs ~nothing meanwhile.
+    # The flake devShell is CI's toolchain now, and this lock pins what it
+    # resolves from nixpkgs-toolchain and rust-overlay: zig, cargo-zigbuild,
+    # rcodesign, the stdenv C compiler, cmake. A bump of any of those moves the
+    # lock, so it can no longer replay results built by the previous toolchain.
+    # The compiler itself is pinned by rust-toolchain.toml (above). protoc,
+    # moon, kache, uv and node are prebuilt archives whose version and hash live
+    # in flake.nix, which is NOT in this group - a protoc bump still moves
+    # nothing declared here. build-dist alone adds flake.nix, below.
     - 'flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
@@ -107,11 +106,12 @@ tasks:
   # would hit the hash this one already cached and ship nothing. `rust: {}` now
   # adds the host triple on top; the separate task is still what guarantees it.
   #
-  # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
-  # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
-  # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
-  # persistent CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the
-  # workspace target dir and dist/ lands at the root where publish-release reads it.
+  # Machine cross-compile on the pond-ci runner (no docker/buildkit): the whole
+  # toolchain (rust + its three cross targets, zig 0.16, cargo-zigbuild, the
+  # macOS SDK via SDKROOT, rcodesign) comes from the flake devShell the job
+  # enters before this runs. Incremental cache = the runner's persistent
+  # CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the workspace
+  # target dir and dist/ lands at the root where publish-release reads it.
   # The body lives in ops/scripts/build-dist.sh, not inline here: moon
   # fingerprints an inline `script:` verbatim, so every comment edit in it
   # invalidated a three-target cross-compile. As a declared input below, only a
@@ -133,6 +133,10 @@ tasks:
       - '@group(sources)'
       - 'ops/scripts/build-dist.sh'
       - 'ops/scripts/patch-macos-sdk.py'
+      # The macOS SDK stubs and the cargo-zigbuild patch live in flake.nix, not
+      # flake.lock, and both change what ships. Free here: every release
+      # already misses on the version bump above.
+      - 'flake.nix'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'

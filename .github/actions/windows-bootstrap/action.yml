@@ -50,7 +50,9 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
+        # Keep in lockstep with `protoc` in flake.nix's toolVersions, by hand:
+        # flake-check's parity step reads flake.nix and rust-toolchain.toml
+        # only, so a bump left behind in this file fails nothing.
         $v = '36.1'
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
         Expand-Archive protoc.zip -DestinationPath C:\protoc
@@ -66,8 +68,9 @@ runs:
       run: |
         "AWS_LC_SYS_PREBUILT_NASM=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-    # Pinned to the version .github/actions/bootstrap installs on Linux: the two
-    # share a remote cache, and moon refuses a cache written by another version.
+    # Pinned to the `moon` in flake.nix's toolVersions, which is what the Linux
+    # legs get from the devshell: the two share a remote cache, and moon refuses
+    # a cache written by another version.
     # Located by search rather than by guessing the archive layout.
     - name: Install moon
       shell: pwsh
@@ -128,8 +131,11 @@ runs:
         "TEMP=D:\temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         "TMP=D:\temp"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-    # rustup honors rust-toolchain.toml; the host triple IS the build target,
-    # so no extra rust-std is downloaded.
+    # rustup honors rust-toolchain.toml, and the host triple IS this leg's build
+    # target. The file's `targets` list is there for the Linux dist cross-build,
+    # which has no rustup to add them imperatively any more; rustup downloads
+    # those three rust-std here too, which is ~90 MB this leg never links
+    # against. Accepted: one pin file beats two, and this runner is hosted.
     - name: Materialize the pinned toolchain
       shell: pwsh
       run: |
@@ -191,17 +197,17 @@ runs:
         s3-bucket: ttq
         s3-endpoint: https://nbg1.your-objectstorage.com
         s3-region: nbg1
-        # Same prefix as the dist build's raw-kache usage. Content-addressed and
-        # triple-keyed, so sharing can only add hits, never cross-contaminate.
-        # Asserted equal to the config file's `prefix` by the step above.
+        # Per caller (see the s3-prefix input). Asserted equal to the config
+        # file's `prefix` by the step above.
         s3-prefix: ${{ inputs.s3-prefix }}
         s3-access-key-id: ${{ inputs.kache-access-key-id }}
         s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
         github-cache: false
-        # Pinned like Linux pins KACHE_VERSION: the default resolves latest at
-        # run time, so an upstream cache-key bump invalidates the store with no
-        # commit here. 0.14.0's bump cost a 138 min run against 9.5 min warm.
-        # Bumped in lockstep with the Linux KACHE_VERSION and the k-tag in the
+        # Pinned like the Linux legs pin `kache` in flake.nix's toolVersions: the
+        # default resolves latest at run time, so an upstream cache-key bump
+        # invalidates the store with no commit here. 0.14.0's bump cost a 138 min
+        # run against 9.5 min warm.
+        # Bumped in lockstep with that flake pin and the k-tag in the
         # prefixes, never alone. kache strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
         # what the bump buys is key schema 31; schema 25 could under-key

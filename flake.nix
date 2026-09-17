@@ -1,13 +1,25 @@
 {
   description = "pond - lossless session storage and search for AI agent clients";
 
+  # pond's own binary cache: public read, signed paths, no credential - so fork
+  # PRs, hosted runners and dev machines all pull the same toolchain closure
+  # instead of rebuilding it (plan 2609-16 2.7). Nix ignores a flake's config
+  # for a user it does not trust, which is why the pond-ci devshell-entry step
+  # passes the same two settings as explicit flags; a dev machine that wants
+  # them needs `--accept-flake-config` or the settings in its own nix.conf.
+  nixConfig = {
+    extra-substituters = [ "https://pond-nix-cache.nbg1.your-objectstorage.com" ];
+    extra-trusted-public-keys = [ "pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # The devShell resolves against THIS input, not `nixpkgs`, so a routine
     # `nixpkgs` bump (which only feeds `packages.pond`) moves no compiler store
-    # path: cargo does not rerun build scripts and moon/kache keys do not miss.
-    # Bump it deliberately and expect one cold build when you do.
+    # path: cargo does not rerun build scripts and kache keys do not miss.
+    # moon's do: /flake.lock is a declared input of the Rust tasks, whichever
+    # input moved. Bump this one deliberately and expect one cold build.
     nixpkgs-toolchain.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Vendored rustup manifests, so `fromRustupToolchainFile` stays a pure eval -
@@ -38,8 +50,8 @@
 
       # Every tool version in one place, in plain `name = "x.y.z";` form on
       # purpose: a reader without Nix can extract it by text, which is how the
-      # Windows leg will read these once it stops carrying its own copies (plan
-      # phase 5). The flake-check job keeps that text form honest today - it
+      # Windows leg will read these once it stops carrying its own copies.
+      # The flake-check job keeps that text form honest today - it
       # fails when the literals and `nix eval --json .#lib.toolVersions`
       # disagree. Rust is not repeated here - it is read from
       # rust-toolchain.toml, which stays the single Rust pin.
@@ -204,23 +216,10 @@
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-          # cargo-zigbuild copies this def in at build time to work around zig
-          # having no -lsynchronization (ziglang/zig#14919), and that write into
-          # a read-only store path fails silently (.ok()). Bake it in instead.
-          # The lib tree is symlink-copied (~220 MB of real files stay shared)
-          # and zig is pointed at the copy through ZIG_LIB_DIR.
-          zig =
-            let
-              base = pinned v.zig pkgs.zig_0_16;
-            in
-            pkgs.runCommand "zig-${v.zig}-pond" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-              mkdir -p $out/bin $out/lib
-              cp -as ${base}/lib/zig $out/lib/zig
-              find $out/lib/zig -type d -exec chmod u+w {} +
-              cp ${base}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
-                 $out/lib/zig/libc/mingw/lib-common/synchronization.def
-              makeWrapper ${base}/bin/zig $out/bin/zig --set-default ZIG_LIB_DIR $out/lib/zig
-            '';
+          # Also handed to cargo-zigbuild below: nixpkgs wraps it with its own
+          # `zig` on PATH, so without the override the pin would guard a
+          # different attribute than the zig that actually links the release.
+          zig = pinned v.zig pkgs.zig_0_16;
 
           moon = prebuilt {
             pname = "moon";
@@ -230,7 +229,7 @@
           };
 
           # nixpkgs' protobuf is deliberately not used: protoc's exact version
-          # is a pin the bootstrap actions mirror by hand, and nixpkgs' would
+          # is a pin windows-bootstrap mirrors by hand, and nixpkgs' would
           # float with the input instead of staying that pin.
           protoc = prebuilt {
             pname = "protoc";
@@ -298,7 +297,20 @@
             packages = [
               rustToolchain
               zig
-              (pinned v.cargoZigbuild pkgs.cargo-zigbuild)
+              # 0.23.4 on zig 0.16 detaches the -exported_symbols_list operand
+              # and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
+              # The fix (#480) is unreleased; drop this patch once a >=0.23.5
+              # release reaches nixpkgs-toolchain.
+              (pinned v.cargoZigbuild (
+                (pkgs.cargo-zigbuild.override { inherit zig; }).overrideAttrs (o: {
+                  patches = (o.patches or [ ]) ++ [
+                    (pkgs.fetchpatch {
+                      url = "https://github.com/rust-cross/cargo-zigbuild/commit/110abf59ba07cb84ed71b31c8cd81eefdc37bcec.patch";
+                      hash = "sha256-CTmasj5u7EqWuJaZKbuxP/Vq4IYJJZKpHMPqa+EWM80=";
+                    })
+                  ];
+                })
+              ))
               (pinned v.rcodesign pkgs.rcodesign)
               (pinned v.gh pkgs.gh)
               moon
@@ -310,16 +322,29 @@
               pkgs.pkg-config
               # ops/scripts/*.sh and the dist build's patch-macos-sdk.py.
               pkgs.python3
+              # Declared, not inherited: `tar -cJf` in the dist build shells out
+              # to xz, and xz is only on PATH today because stdenv's initialPath
+              # happens to carry it. That is not a pin anyone chose, and the
+              # archive it compresses is the released artifact.
+              pkgs.xz
+              # The runner image is actions-runner plus nix and gh only, so
+              # nothing else off the shell is guaranteed: `cargo metadata | jq`
+              # in ci.yml and the devshell-entry step's env filtering need it.
+              pkgs.jq
             ]
             # The SDK is the cross-link stub set; on darwin the native SDK that
             # comes with the stdenv clang wrapper is the right one.
             ++ lib.optional stdenv.hostPlatform.isLinux macosSdk;
 
-            # bindgen consumers need libclang at runtime. The C compiler itself
-            # stays the stdenv default (gcc on Linux, clang on darwin), which is
-            # what the runner image and macos-verify use today - putting a
-            # second clang on PATH would silently change who builds cc-crate code.
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            # No LIBCLANG_PATH and no clang here on purpose. `bindgen` is not in
+            # Cargo.lock at all, so nothing in the resolved graph runs it: the
+            # -sys crates that CAN use it (aws-lc-sys, libsqlite3-sys, zstd-sys,
+            # lz4-sys) all resolve to their prebuilt-bindings path, and
+            # aws-lc-sys 0.41.0 depends only on cc/cmake/dunce/fs_extra. The
+            # C compiler stays the stdenv default (gcc on Linux, clang on
+            # darwin) for the same reason it always did - a second clang on PATH
+            # would silently change who builds cc-crate code. Re-add both
+            # together, not the env var alone, if a bindgen consumer ever lands.
 
             # moon's rust plugin prepends $CARGO_HOME/bin to PATH
             # (toolchains/rust/src/tier2.rs), so a rustup proxy left in the

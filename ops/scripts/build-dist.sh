@@ -8,32 +8,29 @@
 #
 # Runs from the repo root (moon runs the task on the `repo` project), so cargo
 # resolves the workspace target dir and dist/ lands where publish-release reads
-# it. Needs the pond-runner image toolchain: zig 0.16 + cargo-zigbuild + the
-# macOS SDK via SDKROOT + rcodesign, plus rustup on PATH.
+# it. The whole toolchain (rust + its three cross targets, zig 0.16,
+# cargo-zigbuild, the macOS SDK via SDKROOT, rcodesign) comes from the flake
+# devShell the job enters before this runs.
 set -euo pipefail
 
-export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
+# Assigned before export: `export X="$(...)"` returns export's status, so a
+# failing git would slip past `set -e` and bake an empty commit into the binary.
+POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
+export POND_BUILD_COMMIT
 TD="${CARGO_TARGET_DIR:-target}"
 
-# `profile = "minimal"` + targets-in-toml does not reliably fetch
-# rust-std for non-host targets.
-rustup target add aarch64-apple-darwin \
-                  aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
-
-# cargo-zigbuild 0.23.4 on zig 0.16 detaches the -exported_symbols_list
-# operand and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
-# Reporting zig <0.16 takes the old path that strips that flag pair; drop
-# this once a release carries rust-cross/cargo-zigbuild#480.
-export CARGO_ZIGBUILD_ZIG_VERSION=0.15.2
+# No `rustup target add` here any more: rust-toolchain.toml lists all three
+# targets and rust-overlay materializes them with the toolchain, so there is
+# nothing left to fetch imperatively - and no rustup to fetch it with.
 
 # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
 # cold-start net for a fresh /ci-cache. The remote is no longer written
-# here - it lives in .github/kache/linux-dist.toml, which the bootstrap
-# selects through KACHE_CONFIG, so the wrapper and any daemon kache spawns
-# for itself both resolve it from a file they can re-read. The old stub
-# named no bucket and leaned on the job's KACHE_S3_* env, which kache
-# strips from a daemon spawn. Push on EXIT, not after success: crates
-# compiled before a failure still warm the retry.
+# here - it lives in .github/kache/linux-dist.toml, which
+# .github/actions/devshell selects through KACHE_CONFIG, so the wrapper and
+# any daemon kache spawns for itself both resolve it from a file they can
+# re-read. The old stub named no bucket and leaned on the job's KACHE_S3_*
+# env, which kache strips from a daemon spawn. Push on EXIT, not after
+# success: crates compiled before a failure still warm the retry.
 # --all: one paginated LIST of the per-job prefix instead of one LIST
 # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
 # worse from a runner). Safe only because the prefix holds exactly this
