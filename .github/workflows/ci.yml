@@ -61,6 +61,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/devshell
+        id: devshell
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant). The
       # plugin suites run here too - they cost seconds next to the Rust build,
@@ -90,6 +91,32 @@ jobs:
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
           hermes-pond:test
+
+      # Publishes the toolchain closure this job entered, so cold pods, fork PRs
+      # and dev machines substitute it (plan 2.7). Main pushes only: the signing
+      # credential lives nowhere else (plan 2.8 point 2). Non-fatal - the cache
+      # is a cold-start optimization; nix copy skips paths the bucket already has.
+      - name: Push the devshell closure to the binary cache
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.devshell.outputs.profile != '' }}
+        continue-on-error: true
+        # continue-on-error does not cover the job timeout: a stalled upload
+        # must fail this step, not run out the job's clock and redden the build.
+        timeout-minutes: 15
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          # kache's Hetzner key pair also has write access to pond-nix-cache.
+          AWS_ACCESS_KEY_ID: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          PROFILE: ${{ steps.devshell.outputs.profile }}
+        run: |
+          set -euo pipefail
+          key=$(mktemp -p "$RUNNER_TEMP")
+          trap 'rm -f "$key"' EXIT INT TERM
+          printf '%s' "$NIX_CACHE_SIGNING_KEY" | tr -d '\n' > "$key"
+          # region must be nbg1: Hetzner rejects signatures for any other region.
+          nix --extra-experimental-features nix-command copy \
+            --to "s3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&compression=zstd&secret-key=$key" \
+            "$(readlink -f "$PROFILE")"
 
   # Hosted, never pond-ci: the pond-ci pods are unprivileged, so their nix runs
   # with `sandbox = false` - weaker conditions than the users this check
