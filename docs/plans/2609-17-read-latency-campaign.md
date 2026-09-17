@@ -121,16 +121,18 @@ Conclusion: blob v2 is a **bandwidth** fix only. `get_message` latency is
 
 | id | issue | title | depends on / gate |
 |---|---|---|---|
-| M0 | #282 | lance 11 -> 12 upgrade | in progress by a separate agent |
-| M1 | #283 | MCP via long-lived `pond serve` | none |
-| M2 | #284 | derived preview / `body_text` columns + local summary map | none |
-| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | #282 |
+| M0 | #282 | lance 11 -> 12 upgrade | PR #289 open (polished, awaiting merge) |
+| M1 | #283 | MCP via long-lived `pond serve` | PR #292 open (green, awaiting merge) |
+| M2 | #284 | derived preview / `body_text` columns + local summary map | implementation in progress |
+| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | diagnosis DONE (see section 4); fix gated on #289 merging |
 | M3b | #286 | blob v2 bandwidth pass | GATED on a re-measure after M2 + M3a; preconditioned on #288 and on a storage-version guard (`classify_schema` compares names only) |
 | M4 | #287 | `pond_sql` just-works + params-only ngram (backlog) | #284 |
 
 Filed alongside, outside the campaign scope but blocking M3b: **#288**
 `bug(maintenance): parts compaction rewrite loop - ~80 GiB/day rewritten for a
-4.5 GiB table` (root cause and proposed fix in the issue).
+4.5 GiB table` (root cause and proposed fix in the issue). Hotfixed the same
+evening as PR #290 (row-aware veto floor, settled-fragment absorb veto,
+cleanup interval 16 -> 8), CI green, awaiting merge.
 
 Implementation starts with **M1, M2 and M3a only**.
 
@@ -139,8 +141,18 @@ Implementation starts with **M1, M2 and M3a only**.
 Each is owned by one of the issues above. Three were resolved later the same
 day (evidence in the linked issues):
 
-- `find_session` fan-out mechanism: 9,652 GETs against 62 objects is
-  unreconciled. OPEN - diagnosis in progress under #285.
+- `find_session` fan-out mechanism: RESOLVED - one small GET per
+  `sessions.lance` fragment not covered by `sessions_id_btree`'s
+  fragment_bitmap, paid on every `find_session` (pond never sets
+  `fast_search`, so un-indexed fragments are loaded and refined). Linear in
+  the un-indexed fragment count; fold thresholds never trip at 1-3 appended
+  sessions per 5-min sync, so the tail grows unboundedly (~1,379 fragments at
+  storm time; 9,652 GETs = ~1,379 x ~7 requests/fragment). The 62-object
+  listing was a post-compaction snapshot. A compaction on 2026-09-17 already
+  collapsed warm gets to ~2-3 s. Fix (under #285, gated on #289): unconditional
+  sessions index fold per sync + resident sessions keymap as the durable
+  follow-up. Evidence in the #285 hand-back; probes preserved on the slot-1
+  worktree branch (commit 9d51c70).
 - Compaction churn root cause: RESOLVED - it is the rewrite loop, with cleanup
   lag as a secondary amplifier; root cause and fix proposal in #288.
 - ngram size and RSS under v12 on a params-only corpus. OPEN - re-measure under
