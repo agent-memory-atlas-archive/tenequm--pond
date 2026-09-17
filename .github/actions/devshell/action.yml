@@ -171,7 +171,6 @@ runs:
         zig version
         cargo-zigbuild --version
         rcodesign --version
-        gh --version
         xz --version | head -1
         # Not optional extras: uv runs hermes-pond's suite, python3 patches the
         # darwin SDK load command in the dist build, jq reads cargo metadata.

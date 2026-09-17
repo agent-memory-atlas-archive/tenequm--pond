@@ -39,7 +39,10 @@ history; file citations are from the tools' own repos.
   a moon input, whichever input moved). Without this, every lock bump
   costs one ~100s-class cold build.
 - **From nixpkgs at the exact versions already pinned**: zig 0.16,
-  cargo-zigbuild 0.23.4 (overridden onto that same zig), rcodesign 0.29.0, gh.
+  cargo-zigbuild 0.23.4 (overridden onto that same zig), rcodesign 0.29.0.
+  gh was here too and was dropped (PR #276): it is the host's GitHub client, a
+  shell copy shadowed the host's auth wiring, and pond-ci jobs get it from the
+  pond-runner image instead.
   The runner image's `synchronization.def` copy is dropped, not ported: it only
   served the windows-gnu target, which is gone.
 - **Custom fetch packages** (the infra-repo pattern: fetchurl + install):
