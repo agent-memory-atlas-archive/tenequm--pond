@@ -270,6 +270,12 @@ jobs:
     # PRs still replay docs/CI-only diffs from main's own stored hashes.
     env:
       MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # On-demand cache warmer: a main push whose head commit message carries
+      # '[force-build]' compiles for real even on a moon hash hit - the way to
+      # repopulate a cold kache prefix without waiting for an input-changing
+      # merge (dispatch can't do it: kache is read-only outside branch pushes).
+      # Renders literal 'true'/'false', the only values moon's --force accepts.
+      MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
     #
@@ -397,6 +403,8 @@ jobs:
     # write window instead of replaying a dispatch-stored hash.
     env:
       MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # Same '[force-build]' warmer as windows-verify.
+      MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     steps:
       - name: Allow long paths in git
         shell: pwsh
