@@ -836,7 +836,9 @@ jobs:
   # that already published; "Re-run failed jobs" retries just this.
   winget-publish:
     needs: [dist-build, publish-release]
-    if: ${{ needs.publish-release.outputs.released == 'true' }}
+    # Disabled until the winget token gets CreateRef on the winget-pkgs fork
+    # (komac: "tenequm does not have the correct permissions to execute CreateRef").
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Same rule as flake-check/macos-verify: the workflow-level env hands this
