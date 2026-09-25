@@ -1,12 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
-//! `POST /v1/search`, `POST /v1/get-session`, and `POST /v1/get-message`
-//! are thin adapters over the shared wire handlers. The router is driven via
-//! `tower::ServiceExt::oneshot` - no HTTP client dependency. The exception is
-//! `shutdown_completes_while_an_mcp_stream_is_open`, which does bind a socket:
-//! the hang it covers is in the connection drain, and `oneshot` never opens a
-//! connection to drain.
+//! `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`, and
+//! `POST /v1/x/sql` are thin adapters over the shared wire handlers. The router
+//! is driven via `tower::ServiceExt::oneshot` - no HTTP client dependency. The
+//! exceptions bind a socket: `shutdown_completes_while_an_mcp_stream_is_open`,
+//! because the hang it covers is in the connection drain and `oneshot` never
+//! opens a connection to drain, and `unix_socket_serves_sql_and_is_removed_on_shutdown`,
+//! which is about the socket's lifecycle.
 
 use std::{
     net::SocketAddr,
@@ -27,12 +28,12 @@ use pond::{
     sessions::{Store, embedding_dim},
     substrate::MaintenancePolicy,
     transport::{AppState, http},
-    wire::{ErrorCode, GetEnvelope, SearchEnvelope},
+    wire::{ErrorCode, GetEnvelope, SearchEnvelope, SqlEnvelope},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tower::ServiceExt;
@@ -216,7 +217,10 @@ async fn mcp_session(addr: SocketAddr) -> anyhow::Result<String> {
 /// Write one raw HTTP/1.1 request and read back just the response head. Raw
 /// rather than through a client crate: the point is to own the socket and
 /// decide when it closes, which is what this test is about.
-async fn request(stream: &mut TcpStream, raw: &str) -> anyhow::Result<String> {
+async fn request(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    raw: &str,
+) -> anyhow::Result<String> {
     // Deadlined: the read below has no natural end, so a regression that stalls
     // before emitting headers would hang this test until the CI runner's limit
     // instead of failing it.
@@ -242,9 +246,9 @@ const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `/mcp` route validates `Host` against an allowlist (the MCP spec's
 /// DNS-rebinding defence, carried by rmcp) and that list is loopback-only
 /// unless `serve` is told otherwise - so a server reached by its own public
-/// name answers `/mcp` with 403 until that name is passed in. `/v1/*` carries
-/// no such check, which is why a hosted pond can look healthy on the JSON API
-/// while every MCP client is refused.
+/// name answers `/mcp` with 403 until that name is passed in. The `/v1/*`
+/// routes other than `/v1/x/sql` carry no such check, which is why a hosted
+/// pond can look healthy on the JSON API while every MCP client is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -315,6 +319,7 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap,
     let request = Request::builder()
         .method("POST")
         .uri(path)
+        .header("host", "127.0.0.1:9797")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -508,5 +513,449 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     };
     assert_eq!(error.error.code, ErrorCode::NotFound);
 
+    Ok(())
+}
+
+/// `POST /v1/x/sql` answers JSON rows keyed by column name, timestamps as
+/// microsecond RFC3339 cursors, with the row cap signalled by `truncated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_returns_json_rows() -> anyhow::Result<()> {
+    let (_temp, store, app) = router().await?;
+    let sessions = store.session_ids().await?.len();
+    assert!(sessions > 2, "the cap below must cut the fixture corpus");
+
+    let (status, headers, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "sql": "SELECT session_id, max(timestamp) AS last_ts, count(*) AS n \
+                    FROM messages GROUP BY session_id \
+                    ORDER BY last_ts DESC, session_id LIMIT 50",
+            "limit": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(headers.contains_key("x-pond-request-id"));
+    let SqlEnvelope::Success(response) = serde_json::from_value(body)? else {
+        panic!("expected a success envelope");
+    };
+    assert_eq!(response.columns, ["session_id", "last_ts", "n"]);
+    assert_eq!(response.row_count, 2);
+    assert_eq!(response.rows.len(), 2);
+    assert!(response.truncated, "the row cap cut the result");
+    for row in &response.rows {
+        assert!(row["session_id"].is_string(), "{row}");
+        assert!(row["n"].is_u64(), "counts are JSON numbers: {row}");
+        let last_ts = row["last_ts"].as_str().expect("timestamps are strings");
+        let (_, fraction) = last_ts.split_once('.').expect("fractional seconds");
+        assert!(
+            fraction.len() == 7 && fraction.ends_with('Z'),
+            "exactly six fractional digits then Z: {last_ts}"
+        );
+        chrono::DateTime::parse_from_rfc3339(last_ts)?;
+    }
+    Ok(())
+}
+
+/// The route is read-only and every query-shaped failure is a 400
+/// `validation_failed` carrying the SQL surface's own recovery text.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_rejects_writes_and_bad_requests() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let sql = |query: &str| json!({"protocol_version": PROTOCOL_VERSION, "query": query});
+
+    for query in [
+        "DELETE FROM messages",
+        "CREATE TABLE t (x INT)",
+        "SELECT 1; SELECT 2",
+        "SELEC 1",
+    ] {
+        let (status, headers, body) = post(&app, "/v1/x/sql", &sql(query)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(headers.contains_key("x-pond-request-id"));
+        let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+            panic!("expected an error envelope for {query}");
+        };
+        assert_eq!(error.error.code, ErrorCode::ValidationFailed, "{query}");
+        assert!(!error.error.message.is_empty());
+    }
+
+    for limit in [0, pond::sql::MAX_INLINE_ROWS + 1] {
+        let mut request = sql("SELECT 1");
+        request["limit"] = json!(limit);
+        let (status, _, body) = post(&app, "/v1/x/sql", &request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}: {body}");
+        let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+            panic!("expected an error envelope for limit {limit}");
+        };
+        assert_eq!(error.error.code, ErrorCode::ValidationFailed);
+    }
+
+    let (status, _, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({"protocol_version": 999, "query": "SELECT 1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::VersionUnsupported);
+    Ok(())
+}
+
+/// `/v1/x/sql` reads arbitrary corpus rows, so it shares the `/mcp` route's
+/// DNS-rebinding defence: loopback and the `--allowed-host` names pass, any
+/// other `Host` is refused before the body is even parsed.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &["pond.example.com".to_owned()],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let body = json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1"}).to_string();
+    let status = |host: &'static str| {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/x/sql")
+            .header("host", host)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+    for host in [
+        "127.0.0.1:9797",
+        "localhost:9797",
+        "[::1]:9797",
+        "pond.example.com",
+    ] {
+        assert_eq!(status(host).await, StatusCode::OK, "{host}");
+    }
+    for host in ["attacker.example.com", "attacker.example.com:9797"] {
+        assert_eq!(status(host).await, StatusCode::FORBIDDEN, "{host}");
+    }
+    Ok(())
+}
+
+/// The read-only gate runs before any dataset open: a write is refused as a
+/// 400 even when the store cannot open the table it names, which a read of
+/// that same table proves.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_rejects_writes_before_opening_tables() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    for entry in std::fs::read_dir(temp.path())? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+    let sql = |query: &str| json!({"protocol_version": PROTOCOL_VERSION, "query": query});
+
+    let (status, _, body) = post(&app, "/v1/x/sql", &sql("SELECT count(*) FROM messages")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let (status, _, body) = post(&app, "/v1/x/sql", &sql("DELETE FROM messages")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::ValidationFailed);
+    Ok(())
+}
+
+/// Namespace resolution runs before any dataset open, so a table-free query
+/// cannot slip an unknown namespace past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_rejects_an_unknown_namespace_before_opening_tables() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    for query in ["SELECT 1", "SELECT count(*) FROM parts"] {
+        let (status, _, body) = post(
+            &app,
+            "/v1/x/sql",
+            &json!({"protocol_version": PROTOCOL_VERSION, "namespace": "other", "query": query}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+            panic!("expected an error envelope for {query}");
+        };
+        assert_eq!(error.error.code, ErrorCode::NamespaceUnknown, "{query}");
+    }
+
+    let (status, _, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "namespace": "local",
+            "query": "SELECT 1 AS ready",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "columns": ["ready"],
+            "rows": [{"ready": 1}],
+            "row_count": 1,
+            "truncated": false,
+            "elapsed_ms": body["elapsed_ms"],
+        }),
+    );
+    Ok(())
+}
+
+/// A malformed body is axum's plain-text rejection, not a pond envelope:
+/// clients must send `Content-Type: application/json` and handle both shapes.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_rejects_a_malformed_body_before_the_handler() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let send = |content_type: Option<&str>, body: &str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/x/sql")
+            .header("host", "localhost");
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+    };
+
+    let response = send(Some("application/json"), "{not json").await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.headers().contains_key("x-pond-request-id"));
+
+    let valid = json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1"}).to_string();
+    let response = send(None, &valid).await?;
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    Ok(())
+}
+
+/// A query that outruns `timeout_seconds` is a 400 whose text names the HTTP
+/// field to raise.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_maps_a_timeout_to_validation_failed() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let (status, _, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "query": "SELECT max(value % 7) FROM generate_series(1, 100000000000)",
+            "timeout_seconds": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::ValidationFailed);
+    assert!(
+        error.error.message.contains("exceeded the 1s limit")
+            && error.error.message.contains("timeout_seconds")
+            && error.error.message.contains("/v1/x/sql"),
+        "{}",
+        error.error.message
+    );
+    Ok(())
+}
+
+/// A deterministic encoder fault is a 500 `internal`, never a retryable 503
+/// `storage_unavailable` a client would retry forever: arrow-json cannot
+/// encode a map with non-string keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_maps_an_encoder_failure_to_internal() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let (status, _, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "query": "SELECT map([1, 2], ['a', 'b']) AS m",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::Internal);
+    Ok(())
+}
+
+/// `--socket` serves the same router over a Unix socket: a supervisor's first
+/// successful connect gets a real answer, and a clean stop removes the socket
+/// file so the path is free for the next run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_serves_sql_and_is_removed_on_shutdown() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let state = empty_state(&temp).await?;
+    let sockets = TempDir::new()?;
+    let path = sockets.path().join("pond.sock");
+    let mut claim = http::SocketClaim::acquire(&path)?;
+    let listener = claim.bind()?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        http::serve_unix(listener, claim, state, &[], async move {
+            let _ = stopped.await;
+        })
+        .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut stream = loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+            break stream;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "socket never accepted a connection"
+        );
+        assert!(!server.is_finished(), "serve exited before accepting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let body =
+        json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1 AS ready"}).to_string();
+    let head = request(
+        &mut stream,
+        &format!(
+            "POST /v1/x/sql HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await?;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    drop(stream);
+
+    stop.send(()).expect("server still running");
+    tokio::time::timeout(Duration::from_secs(30), server).await???;
+    assert!(!path.exists(), "shutdown removes the socket file");
+    Ok(())
+}
+
+/// The binary end to end, as a supervisor runs it: `--socket` wins over an
+/// inherited POND_HOST/POND_PORT instead of failing the parse as a conflict,
+/// the first successful connect is answered, a second server on the same path
+/// is refused, and SIGTERM removes the socket.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("pond.sock");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let serve = || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pond"));
+        command
+            .arg("serve")
+            .arg("--storage-path")
+            .arg(temp.path().join("store"))
+            .arg("--socket")
+            .arg(&path)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("XDG_DATA_HOME", temp.path().join("data"))
+            .env("XDG_CACHE_HOME", temp.path().join("cache"))
+            .env("XDG_STATE_HOME", temp.path().join("state"))
+            .env("POND_HOST", "0.0.0.0")
+            .env("POND_PORT", "1")
+            .env_remove("POND_CONFIG_FILE")
+            .env("NO_COLOR", "1");
+        command
+    };
+    let mut child = serve()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stream = loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+            break stream;
+        }
+        if let Some(status) = child.try_wait()? {
+            panic!("pond serve exited before accepting: {status}");
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            panic!("socket never accepted a connection");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let body =
+        json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1 AS ready"}).to_string();
+    let head = request(
+        &mut stream,
+        &format!(
+            "POST /v1/x/sql HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await?;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    drop(stream);
+
+    let second = serve().output()?;
+    assert!(!second.status.success(), "{:?}", second.status);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("another pond serve owns"), "{stderr}");
+    tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("the refused server leaves the live socket alone");
+
+    let signalled = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(signalled.success());
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output()).await??;
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("serve: http listening on unix:{}\n", path.display())
+    );
+    assert!(!path.exists(), "SIGTERM removes the socket file");
     Ok(())
 }

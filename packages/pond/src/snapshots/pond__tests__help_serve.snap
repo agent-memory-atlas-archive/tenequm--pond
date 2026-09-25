@@ -27,6 +27,11 @@ Options:
           [env: POND_PORT]
           [default: 9797]
 
+      --socket <PATH>
+          Serve HTTP on a Unix socket at this path instead of --host:--port.
+          
+          The socket is owner-only (0600), so no other local user can reach it, and a successful connect means the server is ready (the store opens before the bind). Put it in a directory only you can write: the mode is set by path, so a shared one lets another user swap it. A `<path>.lock` beside it keeps a second server off the path; once that lock is held, any socket already at the path is treated as a dead run's and replaced, any other file is refused, and a clean stop removes the socket. Excludes --host/--port; POND_HOST/POND_PORT in the environment are ignored.
+
       --allowed-host <HOST>
           Public Host value the MCP route also accepts, on top of localhost.
           
@@ -72,3 +77,4 @@ Examples:
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
   pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
+  pond serve --socket /run/user/1000/pond.sock   owner-only Unix socket, ready once it accepts

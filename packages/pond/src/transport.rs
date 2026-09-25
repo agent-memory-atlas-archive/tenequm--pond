@@ -3,9 +3,9 @@
 //! per-transport behavior divergence.
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`,
-//! and `POST /v1/ingest`. MCP
-//! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
-//! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
+//! `POST /v1/ingest`, and the unstable `POST /v1/x/sql` (read-only SQL, JSON
+//! rows). MCP exposes `pond_search` / `pond_get_session` / `pond_get_message`
+//! plus `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
 use std::sync::{
     Arc,
@@ -64,22 +64,28 @@ impl Drop for ActivityGuard {
 
 pub mod http {
     //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get-session`,
-    //! `POST /v1/get-message`, and the `/mcp` route carrying rmcp's
-    //! streamable-HTTP MCP transport.
+    //! `POST /v1/get-message`, `POST /v1/ingest`, `POST /v1/x/sql`, and the
+    //! `/mcp` route carrying rmcp's streamable-HTTP MCP transport - on TCP, or
+    //! on unix an owner-only Unix socket.
 
+    #[cfg(unix)]
+    use std::path::Path;
     use std::{
         future::Future,
         net::{IpAddr, SocketAddr},
+        sync::Arc,
         time::Duration,
     };
 
     use anyhow::Context;
     use axum::{
         Json, Router,
-        extract::{DefaultBodyLimit, State},
-        http::{HeaderValue, StatusCode},
+        extract::{DefaultBodyLimit, Request, State},
+        http::{HeaderValue, StatusCode, header, uri::Authority},
+        middleware::{self, Next},
         response::{IntoResponse, Response},
         routing::post,
+        serve::Listener,
     };
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -89,10 +95,11 @@ pub mod http {
 
     use super::AppState;
     use crate::{
-        handlers::{pond_get_message, pond_get_session, pond_ingest, pond_search},
+        handlers::{pond_get_message, pond_get_session, pond_ingest, pond_search, pond_sql},
         wire::{
             ErrorCode, GetEnvelope, GetMessageRequest, GetSessionRequest, IngestEnvelope,
-            IngestRequest, SearchEnvelope, SearchRequest, default_namespace, new_request_id,
+            IngestRequest, SearchEnvelope, SearchRequest, SqlEnvelope, SqlRequest,
+            default_namespace, new_request_id,
         },
     };
 
@@ -102,16 +109,54 @@ pub mod http {
     /// instead of pond's typed `validation_failed`.
     pub const HTTP_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
-    /// The `Host` authorities the `/mcp` route answers to: rmcp's loopback
-    /// defaults plus `extra`. The MCP spec (2025-06-18) makes a streamable-HTTP
-    /// server validate `Host` against an allowlist so a browser cannot reach a
-    /// local server by rebinding DNS, and rmcp's default list is loopback only.
-    /// A server reached by any other name therefore answers `/mcp` with 403
-    /// until that name is listed - `/v1/*` carries no such check.
+    /// The `Host` authorities the `/mcp` and `/v1/x/sql` routes answer to:
+    /// rmcp's loopback defaults plus `extra`. The MCP spec (2025-06-18) makes a
+    /// streamable-HTTP server validate `Host` against an allowlist so a browser
+    /// cannot reach a local server by rebinding DNS, and rmcp's default list is
+    /// loopback only. A server reached by any other name therefore answers
+    /// those two routes with 403 until that name is listed; `/v1/x/sql` shares
+    /// the gate because it reads arbitrary corpus rows. The other `/v1/*`
+    /// routes carry no such check.
     fn mcp_allowed_hosts(extra: &[String]) -> Vec<String> {
         let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
         hosts.extend(extra.iter().cloned());
         hosts
+    }
+
+    /// rmcp's matching rule, which it does not export: case-insensitive host,
+    /// brackets stripped from IPv6, and a port only when the entry names one.
+    fn host_is_allowed(host: &Authority, allowed: &[String]) -> bool {
+        let normalize = |name: &str| name.trim_matches(['[', ']']).to_ascii_lowercase();
+        let wanted = normalize(host.host());
+        allowed.iter().any(|entry| {
+            let (name, port) = match Authority::try_from(entry.trim()) {
+                Ok(authority) => (normalize(authority.host()), authority.port_u16()),
+                Err(_) => (normalize(entry.trim()), None),
+            };
+            name == wanted && port.is_none_or(|port| host.port_u16() == Some(port))
+        })
+    }
+
+    async fn require_allowed_host(
+        State(allowed): State<Arc<[String]>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Authority::try_from(value).ok())
+            .or_else(|| request.uri().authority().cloned());
+        match host {
+            Some(host) if host_is_allowed(&host, &allowed) => next.run(request).await,
+            _ => (
+                StatusCode::FORBIDDEN,
+                "Forbidden: Host header is not allowed; list this server's name with \
+                 `pond serve --allowed-host <name>`",
+            )
+                .into_response(),
+        }
     }
 
     /// How long [`serve_with_shutdown`] waits, after the MCP sessions have been
@@ -133,14 +178,15 @@ pub mod http {
 
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
-    /// without binding a socket. `allowed_hosts` extends the `/mcp` route's
-    /// loopback `Host` allowlist (see [`mcp_allowed_hosts`]); cancelling
+    /// without binding a socket. `allowed_hosts` extends the loopback `Host`
+    /// allowlist of `/mcp` and `/v1/x/sql` (see [`mcp_allowed_hosts`]); cancelling
     /// `mcp_shutdown` tears down live MCP sessions (see [`serve_with_shutdown`]).
     pub fn router(
         state: AppState,
         allowed_hosts: &[String],
         mcp_shutdown: CancellationToken,
     ) -> Router {
+        let hosts = mcp_allowed_hosts(allowed_hosts);
         let mcp_state = state.clone();
         let mcp = StreamableHttpService::new(
             move || Ok(super::mcp::PondMcp::new(mcp_state.clone())),
@@ -148,7 +194,7 @@ pub mod http {
             // `with_allowed_hosts` replaces the list, so the helper hands it
             // the defaults plus the extras rather than the extras alone.
             StreamableHttpServerConfig::default()
-                .with_allowed_hosts(mcp_allowed_hosts(allowed_hosts))
+                .with_allowed_hosts(hosts.clone())
                 .with_cancellation_token(mcp_shutdown),
         );
         Router::new()
@@ -156,22 +202,22 @@ pub mod http {
             .route("/v1/get-session", post(get_session))
             .route("/v1/get-message", post(get_message))
             .route("/v1/ingest", post(ingest))
+            .route(
+                "/v1/x/sql",
+                post(sql).route_layer(middleware::from_fn_with_state(
+                    Arc::<[String]>::from(hosts),
+                    require_allowed_host,
+                )),
+            )
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
     }
 
-    /// Bind and serve until ctrl-c. `--port 0` selects an OS-assigned free port;
-    /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
+    /// Bind `host:port`. `--port 0` selects an OS-assigned free port; an
+    /// unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
-    /// `allowed_hosts` names the public authorities the `/mcp` route accepts
-    /// (see [`mcp_allowed_hosts`]).
-    pub async fn serve(
-        state: AppState,
-        host: String,
-        port: u16,
-        allowed_hosts: Vec<String>,
-    ) -> anyhow::Result<()> {
+    pub async fn bind(host: &str, port: u16) -> anyhow::Result<TcpListener> {
         let ip: IpAddr = host
             .parse()
             .with_context(|| format!("invalid --host {host:?}"))?;
@@ -182,31 +228,254 @@ pub mod http {
                  the personal pond is single-user"
             );
         }
-        let listener = TcpListener::bind(SocketAddr::new(ip, port))
+        TcpListener::bind(SocketAddr::new(ip, port))
             .await
-            .with_context(|| format!("failed to bind {host}:{port}"))?;
+            .with_context(|| format!("failed to bind {host}:{port}"))
+    }
+
+    /// Serve on a bound TCP listener until ctrl-c. `allowed_hosts` names the
+    /// public authorities `/mcp` and `/v1/x/sql` accept (see
+    /// [`mcp_allowed_hosts`]).
+    pub async fn serve(
+        listener: TcpListener,
+        state: AppState,
+        allowed_hosts: Vec<String>,
+    ) -> anyhow::Result<()> {
         let local = listener
             .local_addr()
             .context("failed to read bound address")?;
+        crate::output::line(&format!("serve: http listening on http://{local}"))?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
         serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
     }
 
-    /// The serving half of [`serve`], with the stop trigger injected. Public so
-    /// the integration test can drive a real socket and a real MCP stream
-    /// without raising a process signal.
+    /// Ownership of a `--socket` path: an exclusive lock on the sidecar
+    /// `<path>.lock`, held from the stale check until after the socket file is
+    /// removed at shutdown. The lock file itself is never removed - unlinking
+    /// it would let a later start lock a fresh inode while an older holder
+    /// still owns the path.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    pub struct SocketClaim {
+        path: std::path::PathBuf,
+        address: socket2::SockAddr,
+        _lock: std::fs::File,
+        /// `(dev, ino)` of the socket this claim bound: the lock file can be
+        /// deleted from outside, so shutdown still checks it removes its own.
+        bound: Option<(u64, u64)>,
+    }
+
+    #[cfg(unix)]
+    impl SocketClaim {
+        /// Runs before the store opens, so a bad or taken path fails before any
+        /// slow work. Holding the lock means no pond server owns the path, so
+        /// any socket there is treated as a dead run's and removed; any other
+        /// file is refused, never deleted.
+        pub fn acquire(path: &Path) -> anyhow::Result<Self> {
+            use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+            let address = socket2::SockAddr::unix(path).map_err(|_| {
+                anyhow::anyhow!(
+                    "--socket {}: too long for a Unix socket path; pick a shorter path",
+                    path.display()
+                )
+            })?;
+            let dir = path
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            if !dir.is_dir() {
+                anyhow::bail!(
+                    "--socket {}: directory {} does not exist; create it or pick another path",
+                    path.display(),
+                    dir.display()
+                );
+            }
+            let mut lock_path = path.as_os_str().to_owned();
+            lock_path.push(".lock");
+            let lock_path = std::path::PathBuf::from(lock_path);
+            let not_regular = || {
+                anyhow::anyhow!(
+                    "--socket lock {} is not a regular file; remove it or pick another path",
+                    lock_path.display()
+                )
+            };
+            // O_NONBLOCK: opening a FIFO planted at the lock path must fail, not hang.
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&lock_path);
+            let lock = match opened {
+                Ok(file) => file,
+                Err(_)
+                    if std::fs::symlink_metadata(&lock_path)
+                        .is_ok_and(|metadata| !metadata.is_file()) =>
+                {
+                    return Err(not_regular());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to open the --socket lock {}", lock_path.display())
+                    });
+                }
+            };
+            let lock_metadata = lock.metadata().with_context(|| {
+                format!(
+                    "failed to inspect the --socket lock {}",
+                    lock_path.display()
+                )
+            })?;
+            if !lock_metadata.is_file() {
+                return Err(not_regular());
+            }
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                    "--socket {}: another pond serve owns this path; stop it or pick another path",
+                    path.display()
+                ),
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
+                }
+            }
+            let metadata =
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    result => Some(result.with_context(|| {
+                        format!("failed to inspect --socket {}", path.display())
+                    })?),
+                };
+            if let Some(metadata) = metadata {
+                if !metadata.file_type().is_socket() {
+                    anyhow::bail!(
+                        "--socket {} exists and is not a socket; remove it or pick another path",
+                        path.display()
+                    );
+                }
+                std::fs::remove_file(path).with_context(|| {
+                    format!("failed to remove stale --socket {}", path.display())
+                })?;
+            }
+            Ok(Self {
+                path: path.to_owned(),
+                address,
+                _lock: lock,
+                bound: None,
+            })
+        }
+
+        /// Binds, narrows the file to 0600, and only then listens: every connect
+        /// is refused until `listen`, so no other user ever reaches the socket
+        /// and the process-wide umask is left alone. A failure after the bind
+        /// removes the socket file again, leaving only the lock file.
+        pub fn bind(&mut self) -> anyhow::Result<tokio::net::UnixListener> {
+            use socket2::{Domain, Socket, Type};
+
+            let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
+                .with_context(|| self.failed("create"))?;
+            socket
+                .bind(&self.address)
+                .with_context(|| self.failed("bind"))?;
+            let listening = self.listen(socket);
+            if listening.is_err() {
+                self.remove_socket();
+            }
+            listening
+        }
+
+        fn listen(&mut self, socket: socket2::Socket) -> anyhow::Result<tokio::net::UnixListener> {
+            use std::{
+                fs::Permissions,
+                os::{fd::OwnedFd, unix::fs::PermissionsExt},
+            };
+
+            let path = &self.path;
+            let context = |step: &str| format!("failed to {step} --socket {}", path.display());
+            self.bound = Some(socket_identity(path).with_context(|| context("inspect"))?);
+            std::fs::set_permissions(path, Permissions::from_mode(0o600))
+                .with_context(|| context("restrict"))?;
+            socket.listen(1024).with_context(|| context("listen on"))?;
+            socket
+                .set_nonblocking(true)
+                .with_context(|| context("configure"))?;
+            let listener = std::os::unix::net::UnixListener::from(OwnedFd::from(socket));
+            tokio::net::UnixListener::from_std(listener).with_context(|| context("register"))
+        }
+
+        fn failed(&self, step: &str) -> String {
+            format!("failed to {step} --socket {}", self.path.display())
+        }
+
+        fn remove_socket(&self) {
+            let path = &self.path;
+            let Some(bound) = self.bound else {
+                return;
+            };
+            if socket_identity(path).ok() != Some(bound) {
+                return;
+            }
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    /// Serve the same router on a bound Unix socket until `stop`, then remove
+    /// the socket file if it is still the one bound, and release the claim.
+    /// Access control is the file's owner-only mode, and readiness is a
+    /// connect that succeeds - there is nothing to publish.
+    #[cfg(unix)]
+    pub async fn serve_unix(
+        listener: tokio::net::UnixListener,
+        claim: SocketClaim,
+        state: AppState,
+        allowed_hosts: &[String],
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let path = &claim.path;
+        let served = async {
+            crate::output::line(&format!("serve: http listening on unix:{}", path.display()))?;
+            tracing::info!(path = %path.display(), "pond serve listening (HTTP /v1/*, MCP /mcp)");
+            serve_with_shutdown(listener, state, allowed_hosts, stop).await
+        }
+        .await;
+        claim.remove_socket();
+        served
+    }
+
+    /// The serving half of [`serve`] and [`serve_unix`], with the stop trigger
+    /// injected. Public so the integration test can drive a real socket and a
+    /// real MCP stream without raising a process signal.
     ///
     /// Stopping is two-stage, because axum's graceful shutdown waits for every
     /// in-flight connection and an MCP client holds its `GET /mcp` stream open
     /// for the life of the session: cancelling the token the streamable-HTTP
     /// service was built with ends those sessions so the drain can finish, and
     /// [`SHUTDOWN_DRAIN`] then bounds the wait for anything that ignored it.
-    pub async fn serve_with_shutdown(
-        listener: TcpListener,
+    pub async fn serve_with_shutdown<L>(
+        listener: L,
         state: AppState,
         allowed_hosts: &[String],
         stop: impl Future<Output = ()> + Send + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        L: Listener,
+        L::Addr: std::fmt::Debug,
+    {
         let mcp_shutdown = CancellationToken::new();
         let server = axum::serve(listener, router(state, allowed_hosts, mcp_shutdown.clone()))
             .with_graceful_shutdown({
@@ -240,7 +509,7 @@ pub mod http {
     /// and a server running as PID 1 gets no default disposition for a signal
     /// it has not handled - so without this arm `serve` ignored the stop
     /// outright and was killed when the supervisor's grace period ran out.
-    async fn shutdown_signal() {
+    pub async fn shutdown_signal() {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -323,6 +592,17 @@ pub mod http {
         with_request_id((status, Json(envelope)).into_response())
     }
 
+    async fn sql(State(state): State<AppState>, Json(mut request): Json<SqlRequest>) -> Response {
+        let _activity = state.track_activity();
+        request.namespace.get_or_insert_with(default_namespace);
+        let envelope = pond_sql(&state.store, request).await;
+        let status = match &envelope {
+            SqlEnvelope::Success(_) => StatusCode::OK,
+            SqlEnvelope::Error(error) => status_for(&error.error.code),
+        };
+        with_request_id((status, Json(envelope)).into_response())
+    }
+
     fn with_request_id(mut response: Response) -> Response {
         if let Ok(value) = HeaderValue::from_str(&new_request_id()) {
             response.headers_mut().insert("x-pond-request-id", value);
@@ -373,6 +653,89 @@ pub mod http {
                 ]
             );
         }
+
+        #[cfg(unix)]
+        #[test]
+        fn socket_claim_is_exclusive_and_clears_only_a_stale_socket() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let claim = SocketClaim::acquire(&path).unwrap();
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("another pond serve owns"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            drop(claim);
+
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            let claim = SocketClaim::acquire(&path).unwrap();
+            assert!(
+                !path.exists(),
+                "a dead run's socket is cleared under the lock"
+            );
+            drop(claim);
+
+            std::fs::write(&path, "not a socket").unwrap();
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("is not a socket"), "{error}");
+            assert!(path.exists(), "a non-socket file is refused, never deleted");
+
+            let orphan = temp.path().join("missing").join("pond.sock");
+            let error = SocketClaim::acquire(&orphan).unwrap_err().to_string();
+            assert!(error.contains(&orphan.display().to_string()), "{error}");
+
+            let too_long = temp.path().join("s".repeat(200));
+            let error = SocketClaim::acquire(&too_long).unwrap_err().to_string();
+            assert!(error.contains("too long for a Unix socket path"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn claimed_socket_binds_owner_only() {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let mut claim = SocketClaim::acquire(&path).unwrap();
+            let _listener = claim.bind().unwrap();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.file_type().is_socket());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            std::os::unix::net::UnixStream::connect(&path).expect("listening once bound");
+            claim.remove_socket();
+            assert!(!path.exists(), "the claim's own socket is removed on stop");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_lock_path_that_is_not_a_regular_file_is_refused() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let lock = temp.path().join("pond.sock.lock");
+            std::os::unix::fs::symlink(temp.path().join("elsewhere"), &lock).unwrap();
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            std::fs::remove_file(&lock).unwrap();
+
+            let made = std::process::Command::new("mkfifo").arg(&lock).status();
+            if !made.is_ok_and(|status| status.success()) {
+                return;
+            }
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_replaced_socket_is_not_removed_on_stop() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let mut claim = SocketClaim::acquire(&path).unwrap();
+            let _listener = claim.bind().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let _successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            claim.remove_socket();
+            std::os::unix::net::UnixStream::connect(&path)
+                .expect("a socket bound at the path after this claim is left alone");
+        }
     }
 }
 
@@ -414,7 +777,6 @@ pub mod mcp {
             pond_search as run_search,
         },
         sql,
-        substrate::Table,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetMessageRequest,
             GetSessionRequest, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire,
@@ -715,8 +1077,10 @@ local/stdio install the response also names the on-disk path so you can open it 
 directly with duckdb/polars.
 
 Pagination - keyset (preferred):
-Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking. \
-The agent owns the cursor (the last sort value it saw); no server-side state.
+Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking, \
+spelled out as an OR - DataFusion rejects row-value comparisons like \
+`(timestamp, message_id) < (...)`. The agent owns the cursor (the last sort value \
+it saw); no server-side state.
 
   -- page 1: most recent 100 messages in pond
   SELECT message_id, timestamp, role, project
@@ -729,7 +1093,8 @@ The agent owns the cursor (the last sort value it saw); no server-side state.
   SELECT message_id, timestamp, role, project
   FROM messages
   WHERE project LIKE '%pond%'
-    AND (timestamp, message_id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
+    AND (timestamp < TIMESTAMP '2026-06-05T08:14:22.123456Z'
+      OR (timestamp = TIMESTAMP '2026-06-05T08:14:22.123456Z' AND message_id < 'last-id'))
   ORDER BY timestamp DESC, message_id DESC
   LIMIT 100;
 
@@ -1164,56 +1529,20 @@ Examples (4 patterns the agent should recognize):
                     ))]));
                 }
             };
-            let inline_rows = sql::DEFAULT_INLINE_ROWS;
-
-            // Open only the tables the query names (spec.md#search): the slow
-            // `parts.lance` open is pure waste for the common messages-only
-            // query. The referenced tables are independent (per-table
-            // caches/mutexes), so overlap their freshness/manifest fetches.
             let store = &self.state.store;
-            let query = params.query.as_str();
-            let tables = match tokio::try_join!(
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "sessions") {
-                        true => Some(store.dataset(Table::Sessions).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "messages") {
-                        true => Some(store.dataset(Table::Messages).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "parts") {
-                        true => Some(store.dataset(Table::Parts).await?),
-                        false => None,
-                    })
-                },
-            ) {
-                Ok((sessions, messages, parts)) => sql::Tables {
-                    sessions,
-                    messages,
-                    parts,
-                },
-                Err(_) => {
-                    return Err(ErrorData::internal_error(
-                        "sql datasets unavailable".to_owned(),
-                        None,
-                    ));
-                }
-            };
-
-            match sql::run(
-                &tables,
-                &params.query,
-                mode,
-                inline_rows,
-                params.timeout_seconds,
-            )
-            .await
-            {
+            let outcome = async {
+                let tables = sql::open_tables(store, &params.query, mode).await?;
+                sql::run(
+                    &tables,
+                    &params.query,
+                    mode,
+                    sql::DEFAULT_INLINE_ROWS,
+                    params.timeout_seconds,
+                )
+                .await
+            }
+            .await;
+            match outcome {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::Export {
                     bytes,
@@ -1237,11 +1566,22 @@ Examples (4 patterns the agent should recognize):
                         )),
                     }
                 }
+                Ok(sql::Outcome::Json(_)) => Err(ErrorData::internal_error(
+                    "pond_sql never requests JSON rows".to_owned(),
+                    None,
+                )),
                 Err(sql::SqlError::Query(message)) => {
                     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
                 }
+                Err(sql::SqlError::Storage(error)) => Err(ErrorData::internal_error(
+                    format!(
+                        "sql failed: {error:#}; the store failed transiently - retry the \
+                         query, and run `pond status` to check the store if it persists"
+                    ),
+                    None,
+                )),
                 Err(sql::SqlError::Infra(error)) => Err(ErrorData::internal_error(
-                    format!("sql execution failed: {error}"),
+                    format!("sql failed: {error:#}"),
                     None,
                 )),
             }
