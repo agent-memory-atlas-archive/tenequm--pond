@@ -199,8 +199,8 @@ jobs:
       # carrying its own copies. This step keeps that text form honest: the
       # literals, plus rust-toolchain.toml's channel which is not repeated
       # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc/kache copies; the "lockstep"
-      # comments there are still the only guard for those.
+      # windows-bootstrap's own moon/protoc/kache copies or dist-build-unix's
+      # kache pin; the "lockstep" comments there are the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
           set -euo pipefail
@@ -589,6 +589,40 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       - uses: ./.github/actions/devshell
+
+      # kache is not in the flake devShell (a per-machine tool, and a repo pin
+      # that disagreed with developers' own daemons), so this job - the only
+      # Linux consumer, through RUSTC_WRAPPER in ops/scripts/build-dist.sh -
+      # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
+      # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
+      # manifest/namespace and daemon lifecycle, all of which would change how
+      # this release-only path behaves and cannot be exercised before a release.
+      # This puts the same static musl binary the flake used to build on PATH
+      # and nothing else. The sha256s are pinned here, as the flake pinned them,
+      # rather than read from the release's own .sha256 sidecar: release assets
+      # are mutable, and this binary wraps every rustc call of a shipped build.
+      # Bumped in lockstep with windows-bootstrap's kache-action `version` and
+      # the k-tag in the S3 prefixes, never alone.
+      - name: Install kache
+        env:
+          KACHE_RELEASE: 0.22.0
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64) sha256=5e3066c7e2f2792cf4a365d2b3ae9f5077a8cd20d21639b942289b226e64928a ;;
+            aarch64) sha256=5c95ce19f5e1277f49fdb763f4e89594f2fa16aad8e40f85924807bc9b37f977 ;;
+            *) echo "no pinned kache for $arch" >&2; exit 1 ;;
+          esac
+          asset="kache-$arch-unknown-linux-musl.tar.gz"
+          dir="$RUNNER_TEMP/kache-bin"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$asset" \
+            "https://github.com/kunobi-ninja/kache/releases/download/v${KACHE_RELEASE}/${asset}"
+          echo "$sha256  $dir/$asset" | sha256sum -c -
+          tar -xzf "$dir/$asset" -C "$dir" kache
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/kache" --version
 
       # This job is the only caller that declares a kache remote, and the CLI
       # reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so the
