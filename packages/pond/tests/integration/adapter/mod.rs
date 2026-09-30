@@ -551,7 +551,8 @@ async fn assert_foreign_pair(
         "foreign restore must carry every non-System message ({snapshot_name})",
     );
 
-    insta::assert_snapshot!(snapshot_name, render_files(&files));
+    expect_test::expect_file![format!("snapshots/{snapshot_name}.txt")]
+        .assert_eq(&render_files(&files));
     Ok(())
 }
 

@@ -28,10 +28,7 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/opencode"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/opencode";
 
 fn conformance() -> Conformance<'static> {
     Conformance {

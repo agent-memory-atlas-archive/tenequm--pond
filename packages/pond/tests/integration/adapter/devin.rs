@@ -20,14 +20,8 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, ensure_clean_ingest, ingest_into_temp_store, path_config};
 
-const MACOS_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/macos/cli"
-);
-const WINDOWS_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/windows/cli"
-);
+const MACOS_ROOT: &str = "tests/fixtures/adapter/devin/macos/cli";
+const WINDOWS_ROOT: &str = "tests/fixtures/adapter/devin/windows/cli";
 
 // 5 sessions rows plus 3 subagent children (one in amplified-color, two in
 // chalk-twig); the fork power-almandine copies a subagent link but no
@@ -44,10 +38,7 @@ const FORK: &str = "power-almandine";
 // link row yet), `after` once it reported back, two compactions and a
 // whole-forest re-save later. `after` holds 69 distinct messages, each placed
 // in either the root's trees or the subagent's, so 69 messages are stored.
-const MIDRUN_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/midrun"
-);
+const MIDRUN_ROOT: &str = "tests/fixtures/adapter/devin/midrun";
 const MIDRUN_PARENT: &str = "gilded-orca";
 const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
 const MIDRUN_MESSAGES: usize = 69;

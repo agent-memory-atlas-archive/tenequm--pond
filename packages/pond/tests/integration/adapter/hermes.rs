@@ -18,7 +18,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
-const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adapter/hermes");
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/hermes";
 
 // 6 sessions in the default `state.db` + 1 in `profiles/coder/state.db`.
 const FIXTURE_SESSIONS: usize = 7;
