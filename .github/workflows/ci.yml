@@ -197,23 +197,25 @@ jobs:
       # flake check only evaluates - nothing above ever fetches a tarball. This
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
-      # toolVersions is plain literals so a reader without Nix can extract it by
-      # text - which is how the Windows leg will read the pins once it stops
-      # carrying its own copies. This step keeps that text form honest: the
-      # literals, plus rust-toolchain.toml's channel which is not repeated
-      # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc/kache copies or dist-build-unix's
-      # kache pin; the "lockstep" comments there are the only guard for those.
+      # toolVersions holds plain literals wherever it does not read a pin file,
+      # so a reader without Nix can extract it by text. This step keeps that
+      # text form honest: the literals, plus the pins
+      # read from rust-toolchain.toml (rust) and .prototools (moon, protoc),
+      # must equal what the flake evaluates to. It does NOT cover the kache
+      # pins in the Windows `Start kache` step and dist-build-unix; the
+      # "lockstep" comments there are the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
           set -euo pipefail
           out="${RUNNER_TEMP:-$(mktemp -d)}"
           nix eval --json .#lib.toolVersions | jq -S . > "$out/evaluated.json"
-          # rust-toolchain.toml is read LAST so its channel wins the jq merge: a
-          # `rust` literal smuggled into the table would otherwise match the
-          # eval and pass green, defeating the one cross-file assertion here.
+          # The two pin files are read LAST so their values win the jq merge: a
+          # literal smuggled into the table would otherwise match the eval and
+          # pass green, defeating the cross-file assertion here. .prototools
+          # stops at its first table, where its version lines end.
           {
             sed -n '/toolVersions = {/,/^      };/s/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=[[:space:]]*"\([^"]*\)";.*/\1 \2/p' flake.nix
+            sed -n '/^\[/q; s/^\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1 \2/p' .prototools
             sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/rust \1/p' rust-toolchain.toml
           } | jq -Rn '[inputs | split(" ") | {(.[0]): .[1]}] | add' | jq -S . > "$out/extracted.json"
           diff -u "$out/evaluated.json" "$out/extracted.json"
@@ -294,12 +296,9 @@ jobs:
       # MOON_FORCE, which switches moon to write mode and would let a dispatch
       # on any ref upload hashes main later replays (moon crates/cache/src/cache_engine.rs).
       MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
-      # Skips build.rs's Windows manifest on this leg only: kache refuses to cache
-      # a link carrying /MANIFESTINPUT. dist-build-windows still embeds it.
-      POND_SKIP_EMBED_MANIFEST: '1'
-      # Records which key groups changed on a miss, for `kache explain` below. A
-      # fresh runner has no earlier local build, so explain can only compare the
-      # prefetched entries' target/profile/features, not input groups.
+      # Names the key groups that changed in each miss notice. A fresh runner
+      # has no earlier local build, so it can only compare the prefetched
+      # entries' target/profile/features, not input groups.
       KACHE_EXPLAIN_MISS: '1'
       # On-demand cache warmer: a main push whose head commit message carries
       # '[force-build]' compiles for real even on a moon hash hit - the way to
@@ -307,6 +306,14 @@ jobs:
       # merge (dispatch can't do it: kache is read-only outside branch pushes).
       # Renders literal 'true'/'false', the only values moon's --force accepts.
       MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
+      # This job's kache identity: each build shape needs its own prefetch
+      # manifest, and `Start kache` loads the remote from the
+      # .github/kache/<key>.toml it names.
+      KACHE_MANIFEST_KEY: windows-verify
+      # Test leg only, never dist-build-windows: a restored harness has
+      # unresolved .pdb paths, so a failing test gets a weaker backtrace. Worth
+      # ~3 min of link time here; not worth it on the leg whose output ships.
+      KACHE_CACHE_EXECUTABLES: '1'
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
     #
@@ -314,14 +321,12 @@ jobs:
     # a task on a cache hit, and a hosted runner starts with an empty local cache
     # every run, so without the remote there is nothing to hit.
     steps:
-      # MUST precede checkout, and cannot live in the composite action (a local
-      # action only resolves once the repo is checked out). pond's longest
-      # tracked path is 456 characters - a claude-desktop fixture nesting an
-      # encoded project slug inside a session dir - and Git for Windows refuses
-      # it ("Filename too long", exit 128) regardless of the LongPathsEnabled
-      # registry key, because git only opts into `\\?\` paths when
-      # core.longpaths is set. --system, not --global: actions/checkout
-      # relocates HOME while it edits global config.
+      # MUST precede checkout. pond's longest tracked path is 456 characters - a
+      # claude-desktop fixture nesting an encoded project slug inside a session
+      # dir - and Git for Windows refuses it ("Filename too long", exit 128)
+      # regardless of the LongPathsEnabled registry key, because git only opts
+      # into `\\?\` paths when core.longpaths is set. --system, not --global:
+      # actions/checkout relocates HOME while it edits global config.
       - name: Allow long paths in git
         shell: pwsh
         run: git config --system core.longpaths true
@@ -330,25 +335,130 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/windows-bootstrap
-        with:
-          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
-          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
-          manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k35
-          # Test leg only, never dist-build-windows: a restored harness has
-          # unresolved .pdb paths, so a failing test gets a weaker backtrace.
-          # Worth ~3 min of link time here; not worth it on the leg whose
-          # output ships.
-          cache-executables: 'true'
 
-      # The round-one `kache pull dry run` step is gone, deliberately: it
-      # measured the lock-filtered enumeration (one sequential LIST per lock
-      # crate, 126.8 s measured against the shared prefix), and that number did
-      # its job. The bulk `sync --pull --all` it sized is gone too: on R2 the
-      # manifest merges succeed, so kache-action's default manifest prefetch
-      # (`warm: true`) fetches the working set itself. `kache stats` in the
-      # diagnostics below is the number to read.
+      # Anchored and replayed by dist-build-windows, like both kache steps: the
+      # two legs drifted apart the one time each carried its own copy (0ed4a0c).
+      #
+      # moon and protoc are the release zips at the .prototools pins the
+      # devshell reads too, since moon refuses a remote cache written by another
+      # moon version. The pins are read as text above the file's first table,
+      # the same contract flake-check's parity step enforces.
+      #
+      # CARGO_HOME and TEMP move to D:, the runner's fast local disk (C: is
+      # network-attached, actions/runner-images#12416). RUSTUP_HOME stays, which
+      # makes `--no-self-update` load-bearing: a self-update looks for
+      # rustup.exe in $CARGO_HOME/bin and fails (rust-lang/rustup#2946).
+      - &windows-toolchain
+        name: Toolchain on the D drive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Set-JobEnv($name, $value) {
+            Set-Item "env:$name" $value
+            Add-Content $env:GITHUB_ENV "$name=$value"
+          }
+          function Add-JobPath($dir) {
+            $env:PATH = "$dir;$env:PATH"
+            Add-Content $env:GITHUB_PATH $dir
+          }
+          function Expand-Release($url, $name) {
+            $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+            $dir = Join-Path $env:RUNNER_TEMP $name
+            Expand-Archive $zip -DestinationPath $dir
+            $dir
+          }
+
+          $pins = @{}
+          foreach ($line in Get-Content .prototools) {
+            if ($line.StartsWith('[')) { break }
+            if ($line -match '^(\w+)\s*=\s*"([^"]+)"') { $pins[$Matches[1]] = $Matches[2] }
+          }
+          foreach ($tool in 'moon', 'protoc') {
+            if (-not $pins[$tool]) { throw "no $tool pin above the first table in .prototools" }
+          }
+          $protoc = Expand-Release "https://github.com/protocolbuffers/protobuf/releases/download/v$($pins.protoc)/protoc-$($pins.protoc)-win64.zip" protoc
+          Add-JobPath (Join-Path $protoc bin)
+          $moon = Expand-Release "https://github.com/moonrepo/moon/releases/download/v$($pins.moon)/moon_cli-x86_64-pc-windows-msvc.zip" moon
+          Add-JobPath $moon
+          protoc --version
+          moon --version
+
+          New-Item -ItemType Directory -Force -Path D:\temp | Out-Null
+          Set-JobEnv CARGO_HOME 'D:\cargo'
+          Set-JobEnv TEMP 'D:\temp'
+          Set-JobEnv TMP 'D:\temp'
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+          cargo --version
+
+      # kache by pinned sha256 rather than kunobi-ninja/kache-action, whose post
+      # step skips cancelled runs (see `Save kache`). KACHE_RELEASE moves in
+      # lockstep with dist-build-unix's pin and, when cache keys change, the
+      # k-tag in .github/kache/*.toml and dist-build-unix's KACHE_S3_PREFIX.
+      #
+      # The prefetch caps are 0 (unlimited) because kache's defaults drop
+      # expensive crates from this graph, and the store limit stays above the
+      # working set prefetch materializes (a 20 GiB cap evicted mid-run on
+      # 2026-08-26). The Remote check fails the job here rather than letting a
+      # config that did not load run every rustc local-only, since `kache stats`
+      # still exits 0 then. The R2 credentials enter here rather than at job
+      # level, so checkout and the toolchain downloads never see them.
+      - &kache-start
+        name: Start kache
+        shell: pwsh
+        env:
+          KACHE_RELEASE: 1.1.1
+          KACHE_SHA256: fcd465a4bb804c744dd56f9c2dbd4b701d85f0f408c2eac26e0b93f2904d4ddd
+          R2_ACCESS_KEY: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          R2_SECRET_KEY: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Set-JobEnv($name, $value) {
+            Set-Item "env:$name" $value
+            Add-Content $env:GITHUB_ENV "$name=$value"
+          }
+
+          $bin = Join-Path $env:RUNNER_TEMP 'kache-bin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $exe = Join-Path $bin 'kache.exe'
+          Invoke-WebRequest -Uri "https://github.com/kunobi-ninja/kache/releases/download/v$env:KACHE_RELEASE/kache-x86_64-pc-windows-msvc.exe" -OutFile $exe -MaximumRetryCount 3 -RetryIntervalSec 5
+          $sha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:KACHE_SHA256) { throw "kache.exe has sha256 $sha, expected $env:KACHE_SHA256" }
+          Add-Content $env:GITHUB_PATH $bin
+          $env:PATH = "$bin;$env:PATH"
+          Set-JobEnv RUSTC_WRAPPER $exe
+
+          Set-JobEnv KACHE_CONFIG (Join-Path $env:GITHUB_WORKSPACE ".github\kache\$env:KACHE_MANIFEST_KEY.toml")
+          if (-not (Test-Path $env:KACHE_CONFIG)) { throw "no kache config at $env:KACHE_CONFIG" }
+          $match = Select-String -Path $env:KACHE_CONFIG -Pattern '^\s*prefix\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "no [cache.remote] prefix in $env:KACHE_CONFIG" }
+          $prefix = $match.Matches[0].Groups[1].Value
+          Set-JobEnv KACHE_S3_ACCESS_KEY $env:R2_ACCESS_KEY
+          Set-JobEnv KACHE_S3_SECRET_KEY $env:R2_SECRET_KEY
+          Set-JobEnv KACHE_LOG 'kache=info'
+          Set-JobEnv KACHE_NAMESPACE $env:KACHE_MANIFEST_KEY
+          Set-JobEnv KACHE_CACHE_DIR 'D:\kache'
+          Set-JobEnv KACHE_MAX_SIZE '40GiB'
+          Set-JobEnv KACHE_PREFETCH_MAX_BYTES '0'
+          Set-JobEnv KACHE_PREFETCH_MAX_KEYS '0'
+          Set-JobEnv KACHE_PREFETCH_DEADLINE_SECS '0'
+          $runtime = Join-Path $env:RUNNER_TEMP 'kache-runtime'
+          New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+          Set-JobEnv KACHE_RUNTIME_DIR $runtime
+
+          # Started before cargo so the manifest prefetch overlaps the build.
+          kache daemon start
+          $stats = kache stats 2>&1
+          $stats
+          $line = $stats | Select-String -Pattern '^\s*Remote\s+(\S+://\S+)' | Select-Object -First 1
+          if (-not $line) { throw "kache stats printed no Remote row - $env:KACHE_CONFIG did not load" }
+          $remote = $line.Matches[0].Groups[1].Value
+          if ($remote -notmatch "^s3://.+/$([regex]::Escape($prefix))$") {
+            throw "kache resolved its remote to '$remote', expected the '$prefix' from $env:KACHE_CONFIG"
+          }
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
@@ -357,37 +467,41 @@ jobs:
       - name: Test
         run: moon run pond:lint-msvc pond:test-msvc --output-style stream
 
-      # Permanent diagnostics - this is how a cache regression shows up in the
-      # log instead of in stopwatch comparisons. The action's own summary is not
-      # enough: its "Prefetch: 0/N" line counts plan entries, not downloads
-      # (kunobi-ninja/kache#618), so it reads as a total miss on a run that hit
-      # 99.7%. `kache stats` carries the honest
-      # `Hit rate` split (local/prefetch/remote/dup/miss) plus the `Remote` and
-      # `Daemon` rows that say which prefix actually served the run, and
-      # the daemon log is the only place a remote timeout is recorded.
+      # A step, not an action's post hook, so it runs on cancel too, with the
+      # manifest the next run prefetches from first: the runner kills a
+      # cancelled job after five minutes. Only a successful run publishes with
+      # its commit, which drops other commits' stored entries; a failed or
+      # cancelled one publishes without it, which merges with entries saved in
+      # the last hour and replaces older ones (kache keep_stored_entry).
       #
-      # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
-      # `Get-Content -Wait` (src/service.rs), which follows the file forever and
-      # would hold the job to its 180 min timeout. Read the file instead - the
-      # auto-started daemon writes stderr next to its socket, which lives in
-      # KACHE_RUNTIME_DIR (set per job by kache-action).
-      #
-      # continue-on-error is load-bearing under pwsh: GitHub appends an
-      # `exit $LASTEXITCODE` check, so any non-zero kache exit would otherwise
-      # fail the step after the gate has already passed.
-      - name: kache diagnostics
+      # No `kache sync --push`: from the repo root it covers only workspace
+      # crates, which the daemon uploads anyway (same as repo:build-dist).
+      # continue-on-error: saving never fails the job, and pwsh's appended
+      # `exit $LASTEXITCODE` would trip on any non-zero kache exit.
+      - &kache-save
+        name: Save kache
         if: always()
         shell: pwsh
         continue-on-error: true
-        timeout-minutes: 2
+        timeout-minutes: 30
         run: |
+          if ('${{ job.status }}' -ne 'success') { $env:GITHUB_SHA = '' }
+          kache save-manifest --manifest-key $env:KACHE_MANIFEST_KEY --namespace $env:KACHE_NAMESPACE
+          (kache report --format github --since 24h) -replace '^### kache build cache$', "### kache build cache: $env:GITHUB_JOB" | Add-Content $env:GITHUB_STEP_SUMMARY
           kache stats
-          # The crates that missed on a same-commit re-run.
-          kache explain pond
-          kache explain integration
+          if ($env:KACHE_EXPLAIN_MISS) {
+            # The workspace crates that missed on a same-commit re-run.
+            kache explain pond
+            kache explain integration
+          }
           Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
-          if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
+          # The only record of remote timeouts, named after the socket, which a
+          # pull request run scopes (daemon-<scope>.log). Read as a file:
+          # `kache daemon log` once followed it forever on Windows.
+          Get-ChildItem $env:KACHE_RUNTIME_DIR -Filter 'daemon*.log' | ForEach-Object { "== $($_.Name)"; Get-Content -Tail 200 $_.FullName }
+          # Last, because `kache stats` would start a stopped daemon again;
+          # stopping drains the queued uploads.
+          kache daemon stop
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
@@ -420,6 +534,8 @@ jobs:
       MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
       # Same '[force-build]' warmer as build-and-test-windows.
       MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
+      # This leg's kache identity, same shape as build-and-test-windows's.
+      KACHE_MANIFEST_KEY: windows-dist
     steps:
       - name: Allow long paths in git
         shell: pwsh
@@ -429,12 +545,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/windows-bootstrap
-        with:
-          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
-          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
-          manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k35
+      - *windows-toolchain
+      - *kache-start
 
       # Build + smoke + package, as a moon task so the leg gets the same
       # task-level remote cache every other build has. `--profile dist`, not
@@ -468,20 +580,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Same permanent diagnostics as build-and-test-windows, and for the same
-      # reason: this leg runs rarely enough that a silent cache regression would
-      # first be noticed as a slow release. See that job for why the daemon log
-      # is read as a file and why continue-on-error is load-bearing under pwsh.
-      - name: kache diagnostics
-        if: always()
-        shell: pwsh
-        continue-on-error: true
-        timeout-minutes: 2
-        run: |
-          kache stats
-          Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
-          if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
+      # This leg's only manifest save, with the same diagnostics: it runs rarely
+      # enough that a silent cache regression would first show as a slow release.
+      - *kache-save
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -570,16 +671,16 @@ jobs:
       # kache is not in the flake devShell (a per-machine tool, and a repo pin
       # that disagreed with developers' own daemons), so this job - the only
       # Linux consumer, through RUSTC_WRAPPER in the repo:build-dist script -
-      # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
-      # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
-      # manifest/namespace and daemon lifecycle, all of which would change how
-      # this release-only path behaves and cannot be exercised before a release.
-      # This puts the same static musl binary the flake used to build on PATH
-      # and nothing else. The sha256s are pinned here, as the flake pinned them,
-      # rather than read from the release's own .sha256 sidecar: release assets
-      # are mutable, and this binary wraps every rustc call of a shipped build.
-      # Bumped in lockstep with windows-bootstrap's kache-action `version` and
-      # the k-tag in the S3 prefixes, never alone.
+      # installs its own pinned copy. This step only puts the static musl binary
+      # on PATH: RUSTC_WRAPPER comes from repo:build-dist and KACHE_CACHE_DIR
+      # from the job env, and there is no manifest or daemon lifecycle like the
+      # Windows legs' `Start kache`, which would change how this release-only
+      # path behaves and cannot be exercised before a release. The sha256s are
+      # pinned here, as on Windows, rather than read from the release's own
+      # .sha256 sidecar: release assets are mutable, and this binary wraps every
+      # rustc call of a shipped build. Bumped in lockstep with the Windows
+      # `Start kache` KACHE_RELEASE and, when cache keys change, the k-tag in
+      # .github/kache/*.toml and KACHE_S3_PREFIX above, never alone.
       - name: Install kache
         env:
           KACHE_RELEASE: 1.1.1
@@ -779,19 +880,20 @@ jobs:
 
       # moon is the task surface everywhere else, so the release tail goes
       # through it too. Installed here - BEFORE release-plz, ungated - and not
-      # next to the step that uses it: this downloads proto and moon from GitHub
-      # releases, and a rate limit or a 5xx on that download must not land after
-      # the crate is published and the tag is cut. Ten seconds on a run that
-      # publishes nothing is the whole cost. It also sits above
-      # dtolnay/rust-toolchain so rustup's PATH entry outranks proto's shims.
-      #
-      # Version inline rather than read from flake.nix's toolVersions: this job
-      # has no nix, and the task is `cache: false` / `toolchains: system`, so
-      # moon is only the process runner here and a skew against the devshell
-      # cannot change or poison anything. Listed in AGENTS.md with the repo's
-      # other unguarded copies of that pin.
-      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
-        with: { moon-version: '2.6.1', cache: false }
+      # next to the step that uses it: this downloads moon from GitHub releases,
+      # and a rate limit or a 5xx on that download must not land after the crate
+      # is published and the tag is cut. The version is the .prototools pin,
+      # read as text like the Windows legs read it.
+      - name: Install moon
+        run: |
+          set -euo pipefail
+          moon=$(sed -n '/^\[/q; s/^moon[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .prototools)
+          if [ -z "$moon" ]; then echo "no moon pin above the first table in .prototools" >&2; exit 1; fi
+          dir="$RUNNER_TEMP/moon"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 "https://github.com/moonrepo/moon/releases/download/v${moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz" | tar -xJ --strip-components=1 -C "$dir"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/moon" --version
 
       # Same pinned action as release-prep. RUSTUP_TOOLCHAIN outranks
       # rust-toolchain.toml, so rustup does not install pond's pin just to run
