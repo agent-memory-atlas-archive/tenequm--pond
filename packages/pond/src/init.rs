@@ -378,8 +378,7 @@ pub(crate) async fn run(
 
     // ---- first sync, then the schedule --------------------------------------
     // The scheduler registers only AFTER the first sync completes: a fresh
-    // systemd timer's OnBootSec elapse is already in the past, so it fires
-    // ~immediately on registration - racing the (long, first) manual sync it
+    // systemd timer can elapse shortly after registration, racing the manual sync it
     // was set up to automate, and the two only slow each other down. Running
     // the first sync inside init also gives it the full progress UI.
     let run_first_sync = prompts

@@ -7353,10 +7353,10 @@ struct LocalStatus {
     /// The one scheduler probe's answer: rendered line plus the structured
     /// active/backend/cadence fields (JSON emits those directly).
     schedule: crate::schedule::ScheduleSnapshot,
-    /// Estimated seconds until the next scheduled sync (negative = overdue).
-    /// `None` without an active schedule or a last-sync record to anchor on.
-    /// An estimate only: it anchors on the last recorded sync (manual or
-    /// scheduled), while the OS timer ticks on its own clock.
+    /// Seconds until the next scheduled sync (negative = overdue): the
+    /// scheduler's own next firing where it reports one (systemd), else an
+    /// estimate anchored on the last recorded sync (manual or scheduled).
+    /// `None` without an active, healthy schedule or either anchor.
     next_run_secs: Option<i64>,
 }
 
@@ -7370,13 +7370,6 @@ async fn local_status(
     store_key: &str,
     schedule: crate::schedule::ScheduleSnapshot,
 ) -> LocalStatus {
-    // A broken registration will not fire, so it gets no next-run estimate -
-    // gated here at derivation so the text and JSON surfaces agree.
-    let active_every = schedule
-        .problem
-        .is_none()
-        .then_some(schedule.every)
-        .flatten();
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
     // last sync - exactly the baseline "pending since then" wants. It costs one
@@ -7455,12 +7448,22 @@ async fn local_status(
         });
     }
     let last_sync = syncstate::read_last_sync(store_key);
-    let next_run_secs = active_every.and_then(|every| {
-        last_sync.as_ref().map(|record| {
-            (record.finished_at + chrono::Duration::seconds(i64::from(every.secs())) - Utc::now())
+    // A broken registration will not fire, so it gets no next-run estimate -
+    // gated here at derivation so the text and JSON surfaces agree.
+    let next_run_secs = if schedule.problem.is_some() {
+        None
+    } else if let Some(next_run) = schedule.next_run {
+        Some((next_run - Utc::now()).num_seconds())
+    } else {
+        schedule
+            .every
+            .zip(last_sync.as_ref())
+            .map(|(every, record)| {
+                (record.finished_at + chrono::Duration::seconds(i64::from(every.secs()))
+                    - Utc::now())
                 .num_seconds()
-        })
-    });
+            })
+    };
     LocalStatus {
         hostname,
         adapters,
@@ -7600,9 +7603,9 @@ fn render_local_status(local: &LocalStatus, show_adapters_error: bool) -> anyhow
     };
     output(&format!("{} {last_sync_line}", paint("last sync", dim())))?;
     let mut schedule_line = local.schedule.line.clone();
-    // "expected within": the anchor is the last recorded sync (manual or
-    // scheduled) while the OS timer ticks on its own clock, so this is an
-    // upper-bound estimate, not the timer's actual next fire time.
+    // "expected within": systemd's own elapse can still land up to its
+    // accuracy window late, and elsewhere the anchor is the last recorded
+    // sync while the OS timer ticks on its own clock - an estimate either way.
     if let Some(next_run_secs) = local.next_run_secs {
         let suffix = if next_run_secs <= 0 {
             " - next run expected about now".to_owned()

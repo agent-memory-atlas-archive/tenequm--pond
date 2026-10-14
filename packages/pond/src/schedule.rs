@@ -56,8 +56,9 @@ impl ScheduleEvery {
     }
 
     fn from_secs(secs: u32) -> Option<Self> {
-        [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
-            .into_iter()
+        Self::value_variants()
+            .iter()
+            .copied()
             .find(|every| every.secs() == secs)
     }
 }
@@ -105,6 +106,8 @@ pub(crate) struct ScheduleSnapshot {
     /// A registered schedule that cannot run (e.g. the task's launcher path
     /// no longer exists after a reinstall); the text names the fix.
     pub problem: Option<String>,
+    /// When the scheduler itself reports its next firing (systemd only).
+    pub next_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ===========================================================================
@@ -118,6 +121,7 @@ enum State {
         every: Option<ScheduleEvery>,
         /// Registered but unable to run.
         problem: Option<String>,
+        next_run: Option<chrono::DateTime<chrono::Utc>>,
     },
     Inactive,
 }
@@ -132,6 +136,7 @@ impl State {
             backend,
             every,
             problem: None,
+            next_run: None,
         }
     }
 }
@@ -142,6 +147,7 @@ fn render_state(state: &State) -> String {
             backend,
             every,
             problem,
+            ..
         } => {
             let cadence = every
                 .map(|every| format!(", every {}", every.label()))
@@ -171,13 +177,14 @@ pub(crate) fn log_path() -> PathBuf {
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
     match platform_probe() {
         Ok(state) => {
-            let (active, backend, every, problem) = match &state {
+            let (active, backend, every, problem, next_run) = match &state {
                 Active {
                     backend,
                     every,
                     problem,
-                } => (true, Some(*backend), *every, problem.clone()),
-                Inactive => (false, None, None, None),
+                    next_run,
+                } => (true, Some(*backend), *every, problem.clone(), *next_run),
+                Inactive => (false, None, None, None, None),
             };
             ScheduleSnapshot {
                 line: render_state(&state),
@@ -185,6 +192,7 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
                 backend,
                 every,
                 problem,
+                next_run,
             }
         }
         Err(_) => ScheduleSnapshot {
@@ -196,6 +204,7 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
             backend: None,
             every: None,
             problem: None,
+            next_run: None,
         },
     }
 }
@@ -374,6 +383,7 @@ mod unix {
     use std::process::{Command, Stdio};
 
     use anyhow::{Context, Result, bail};
+    use clap::ValueEnum;
 
     use super::{ScheduleEvery, State};
     use State::{Active, Inactive};
@@ -393,6 +403,7 @@ mod unix {
                         problem: systemd_timer_show()
                             .as_deref()
                             .and_then(systemd_timer_problem),
+                        next_run: systemd_next_elapse(),
                     });
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
@@ -696,12 +707,36 @@ mod unix {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// A timer can be `enabled` and `active` with no next elapse, never
-    /// firing again - and `Persistent=true` is what causes it: its stamp
-    /// disables the already-past `OnBootSec=` one-shot on a fresh user
-    /// manager while `OnUnitActiveSec=` has no base (timer.c: the stamp load
-    /// in `timer_start`, the skips in `timer_enter_waiting`). `is-enabled`
-    /// still succeeds, so the elapse properties are the only honest probe.
+    /// The timer's own next firing, randomized delay included. Read raw over
+    /// D-Bus because `systemctl show` renders it in the host's zone, ignoring
+    /// `--timestamp=`, so its text has no portable parse.
+    fn systemd_next_elapse() -> Option<chrono::DateTime<chrono::Utc>> {
+        let output = Command::new("busctl")
+            .args([
+                "--user",
+                "get-property",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1/unit/pond_2dsync_2etimer",
+                "org.freedesktop.systemd1.Timer",
+                "NextElapseUSecRealtime",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        next_elapse_from_busctl(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// `busctl` answers `t <usec>`; 0 and `u64::MAX` mean nothing is armed.
+    fn next_elapse_from_busctl(reply: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let usec: u64 = reply.trim().strip_prefix("t ")?.parse().ok()?;
+        let usec = i64::try_from(usec).ok().filter(|usec| *usec > 0)?;
+        chrono::DateTime::from_timestamp_micros(usec)
+    }
+
+    /// Old monotonic registrations can lose their service activation anchor
+    /// after a user-manager restart. Enablement alone cannot prove recurrence.
     fn systemd_timer_problem(show: &str) -> Option<String> {
         timer_is_dead(show).then(|| {
             "the timer has no next elapse and will never fire again \
@@ -768,19 +803,33 @@ mod unix {
         )
     }
 
+    fn systemd_calendar(every: ScheduleEvery) -> &'static str {
+        match every {
+            ScheduleEvery::M5 => "*-*-* *:0/5:00",
+            ScheduleEvery::M15 => "*-*-* *:0/15:00",
+            ScheduleEvery::H1 => "*-*-* *:00:00",
+            ScheduleEvery::H6 => "*-*-* 0/6:00:00",
+            ScheduleEvery::D1 => "*-*-* 03:00:00",
+        }
+    }
+
     fn systemd_timer_body(every: ScheduleEvery) -> String {
+        // Half-cadence jitter leaves room for systemd's default accuracy window.
         format!(
             "# created and maintained by pond; edits may be replaced\n\
              [Unit]\n\
              Description=pond sync every {}\n\n\
              [Timer]\n\
              OnBootSec=2m\n\
-             OnUnitActiveSec={}s\n\
+             OnCalendar={}\n\
+             RandomizedDelaySec={}s\n\
+             FixedRandomDelay=true\n\
              Persistent=true\n\n\
              [Install]\n\
              WantedBy=timers.target\n",
             every.label(),
-            every.secs(),
+            systemd_calendar(every),
+            (every.secs() / 2).min(ScheduleEvery::H1.secs()),
         )
     }
 
@@ -817,9 +866,11 @@ mod unix {
             .with_context(|| format!("failed to write {}", service_path.display()))?;
         std::fs::write(&timer_path, timer)
             .with_context(|| format!("failed to write {}", timer_path.display()))?;
+        // enable --now cannot revive an active elapsed timer; restart re-arms it.
         for args in [
             vec!["--user", "daemon-reload"],
-            vec!["--user", "enable", "--now", "pond-sync.timer"],
+            vec!["--user", "enable", "pond-sync.timer"],
+            vec!["--user", "restart", "pond-sync.timer"],
         ] {
             let output = Command::new("systemctl")
                 .args(&args)
@@ -834,11 +885,8 @@ mod unix {
                 );
             }
         }
-        // `enable --now` cannot revive a dead timer - a start job on an
-        // active (`elapsed`) unit is a no-op and `timer_trigger_notify`
-        // ignores dead/failed; only a fresh service activation re-anchors
-        // `OnUnitActiveSec=`. `--no-block` keeps the triggered sync from
-        // holding this command open.
+        // Repair also kicks off a sync now rather than waiting for a calendar
+        // boundary. `--no-block` keeps registration from waiting for the sync.
         if needs_repair {
             let output = Command::new("systemctl")
                 .args(["--user", "start", "--no-block", "pond-sync.service"])
@@ -899,6 +947,19 @@ mod unix {
 
     fn read_systemd_interval() -> Option<ScheduleEvery> {
         let body = std::fs::read_to_string(systemd_unit_dir().join("pond-sync.timer")).ok()?;
+        systemd_interval(&body)
+    }
+
+    fn systemd_interval(body: &str) -> Option<ScheduleEvery> {
+        if let Some(calendar) = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("OnCalendar="))
+        {
+            return ScheduleEvery::value_variants()
+                .iter()
+                .copied()
+                .find(|every| systemd_calendar(*every) == calendar.trim());
+        }
         let line = body
             .lines()
             .find_map(|line| line.trim().strip_prefix("OnUnitActiveSec="))?;
@@ -1092,6 +1153,62 @@ mod unix {
         const STATE: &str = "/home/user/.local/state";
         const CONFIG: &str = "/home/user/.config/pond/config.toml";
 
+        #[test]
+        fn systemd_timers_use_persistent_calendar_recurrence() {
+            for (every, calendar) in [
+                (ScheduleEvery::M5, "*-*-* *:0/5:00"),
+                (ScheduleEvery::M15, "*-*-* *:0/15:00"),
+                (ScheduleEvery::H1, "*-*-* *:00:00"),
+                (ScheduleEvery::H6, "*-*-* 0/6:00:00"),
+                (ScheduleEvery::D1, "*-*-* 03:00:00"),
+            ] {
+                let body = systemd_timer_body(every);
+                assert!(body.contains(&format!("OnCalendar={calendar}\n")), "{body}");
+                assert!(body.contains("OnBootSec=2m\n"), "{body}");
+                assert!(body.contains("Persistent=true\n"), "{body}");
+                assert!(!body.contains("OnUnitActiveSec="), "{body}");
+                assert_eq!(systemd_interval(&body), Some(every));
+            }
+        }
+
+        #[test]
+        fn systemd_timers_spread_hosts_with_a_fixed_delay_below_the_cadence() {
+            for every in ScheduleEvery::value_variants().iter().copied() {
+                let body = systemd_timer_body(every);
+                let delay = body
+                    .lines()
+                    .find_map(|line| line.strip_prefix("RandomizedDelaySec="))
+                    .and_then(|value| value.strip_suffix('s'))
+                    .and_then(|value| value.parse::<u32>().ok());
+                assert!(
+                    delay.is_some_and(|secs| secs > 0
+                        && secs <= every.secs() / 2
+                        && secs <= ScheduleEvery::H1.secs()),
+                    "{body}"
+                );
+                assert!(body.contains("FixedRandomDelay=true\n"), "{body}");
+            }
+        }
+
+        #[test]
+        fn systemd_interval_reads_unrepaired_units_and_rejects_unknown_cadences() {
+            for every in [
+                ScheduleEvery::M5,
+                ScheduleEvery::M15,
+                ScheduleEvery::H1,
+                ScheduleEvery::H6,
+                ScheduleEvery::D1,
+            ] {
+                assert_eq!(
+                    systemd_interval(&format!("OnUnitActiveSec={}s\n", every.secs())),
+                    Some(every)
+                );
+            }
+            for body in ["", "OnUnitActiveSec=123s", "OnCalendar=weekly"] {
+                assert_eq!(systemd_interval(body), None, "{body}");
+            }
+        }
+
         /// Captured verbatim from `systemctl --user show` (systemd 259,
         /// Ubuntu 24.04) on a timer carrying pond's exact generated body
         /// after it elapsed with no anchor left: `systemctl status` shows
@@ -1145,6 +1262,19 @@ mod unix {
             assert!(!next_elapse_missing(
                 "LoadState=loaded\nActiveState=active\n"
             ));
+        }
+
+        #[test]
+        fn next_elapse_is_read_only_from_an_armed_busctl_reply() {
+            assert_eq!(
+                next_elapse_from_busctl("t 1791949277000000\n"),
+                chrono::DateTime::parse_from_rfc3339("2026-10-14T03:41:17Z")
+                    .ok()
+                    .map(|at| at.to_utc()),
+            );
+            for reply in ["t 0\n", "t 18446744073709551615\n", "", "s \"n/a\"\n"] {
+                assert_eq!(next_elapse_from_busctl(reply), None, "{reply}");
+            }
         }
 
         /// The Windows precedent (`launcher_problem_flags_only_a_missing_command`)
@@ -1273,6 +1403,7 @@ mod windows {
             backend: "task-scheduler",
             every: parse_interval_from_xml(&xml),
             problem: launcher_problem(&xml),
+            next_run: None,
         })
     }
 
